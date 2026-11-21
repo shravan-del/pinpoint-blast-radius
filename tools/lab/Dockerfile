@@ -12,6 +12,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends git \
 COPY requirements.lock /tmp/requirements.lock
 RUN pip install --no-cache-dir -r /tmp/requirements.lock
 
+# coverage is not in requirements.lock because the scorer's environment does not
+# need it.  It is a lab-only tool: the maps it produces are committed, so the
+# submission image never installs or runs it.
+RUN pip install --no-cache-dir 'coverage==7.12.0'
+
 RUN git init /src/sqlglot \
     && cd /src/sqlglot \
     && git remote add origin https://github.com/tobymao/sqlglot.git \

@@ -172,6 +172,91 @@ class TestOutput(unittest.TestCase):
         self.assertEqual(finished.stdout, b"")
 
 
+class TestNeverCrashes(unittest.TestCase):
+    """Whatever /data holds, the program exits 0 and prints only answer lines."""
+
+    def _run(self, patches: dict[str, str], *, tests=None, maps: str | None = None,
+             tests_json_text: str | None = None):
+        tests = tests or [
+            {"number": n, "id": f"tests/test_x.py::T::t{n}", "file": "tests/test_x.py",
+             "seconds": (n + 1) / 100}
+            for n in range(20)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            (data / "tests.json").write_text(
+                tests_json_text
+                if tests_json_text is not None
+                else json.dumps({"tests": tests, "skipped": []})
+            )
+            (data / "commits").mkdir()
+            for commit_id, text in patches.items():
+                (data / "commits" / f"{commit_id}.patch").write_bytes(
+                    text if isinstance(text, bytes) else text.encode("utf-8")
+                )
+            environment = dict(
+                os.environ,
+                BLAST_RADIUS_DATA=str(data),
+                PINPOINT_MAPS=maps if maps is not None else str(data / "absent.zip"),
+            )
+            finished = subprocess.run(
+                [sys.executable, str(REPO / "selector.py")],
+                capture_output=True, env=environment,
+            )
+        self.assertEqual(finished.returncode, 0, finished.stderr)
+        return finished.stdout, tests
+
+    def _is_valid(self, stdout, tests, commits):
+        answers = {commit: {"failing": []} for commit in commits}
+        result = score.evaluate_run(stdout, tests, answers)
+        self.assertTrue(result["ok"], result)
+        return result
+
+    def test_missing_maps_falls_back_to_every_test(self):
+        stdout, tests = self._run({"aaaa": "diff --git a/x b/x\n"})
+        self._is_valid(stdout, tests, ["aaaa"])
+        line = json.loads(stdout.decode().splitlines()[0])
+        self.assertEqual(sorted(n for w in line["workers"] for n in w),
+                         list(range(len(tests))))
+
+    def test_a_maps_file_that_is_not_a_zip(self):
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as handle:
+            handle.write(b"definitely not a zip")
+        stdout, tests = self._run({"aaaa": "diff --git a/x b/x\n"}, maps=handle.name)
+        self._is_valid(stdout, tests, ["aaaa"])
+        os.unlink(handle.name)
+
+    def test_rubbish_patches(self):
+        patches = {
+            "aaaa": "",
+            "bbbb": "this is prose, not a diff\n",
+            "cccc": "@@ -1,1 +1,1 @@\n-a\n+b\n",
+            "dddd": "diff --git a/x b/x\n@@ -1,99 +1,99 @@\n-a\n+b\n",
+            "eeee": "\x00\x01\x02 binary rubbish",
+        }
+        stdout, tests = self._run(patches)
+        self._is_valid(stdout, tests, list(patches))
+        self.assertEqual(len(stdout.decode().splitlines()), len(patches))
+        for line in stdout.decode().splitlines():
+            parsed = json.loads(line)
+            self.assertEqual(sorted(n for w in parsed["workers"] for n in w),
+                             list(range(len(tests))))
+
+    def test_a_patch_that_is_not_utf8(self):
+        stdout, tests = self._run({"aaaa": b"diff --git a/x b/x\n\xff\xfe not utf-8\n"})
+        self._is_valid(stdout, tests, ["aaaa"])
+
+    def test_tests_json_with_an_unexpected_shape(self):
+        stdout, _ = self._run({"aaaa": "diff --git a/x b/x\n"},
+                              tests_json_text='{"tests": "not a list"}')
+        self.assertEqual(json.loads(stdout.decode().splitlines()[0]),
+                         {"commit": "aaaa", "workers": []})
+
+    def test_no_commits_at_all(self):
+        stdout, _ = self._run({})
+        self.assertEqual(stdout, b"")
+
+
 class TestAgainstTheRealSampleSet(unittest.TestCase):
     def test_the_packing_is_what_we_expect(self):
         tests = json.loads((REPO / "sample" / "tests.json").read_text())["tests"]
