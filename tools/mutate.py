@@ -513,6 +513,36 @@ def command_generate(arguments: argparse.Namespace) -> int:
             make_patch(target, _read(target), "", status="deleted"))
         manifest[commit_id] = {"kind": "deleted_file", "path": target}
 
+    # Multi-file commits.  The practice set has them and a single-file mutant
+    # never exercises the union across several changes in one patch.
+    mixed_pool = _pool("sqlglot", rng)
+    fixture_pool = _pool("FIXTURES", rng)
+    for _ in range(max(1, round(8 * scale))):
+        pieces, used = [], []
+        for mutator, pool in ((mutate_operator, mixed_pool),
+                              (mutate_comment, mixed_pool),
+                              (mutate_fixture, fixture_pool)):
+            for _attempt in range(25):
+                path = rng.choice(pool)
+                if path in used:
+                    continue
+                try:
+                    produced = mutator(rng, path)
+                except Exception:  # noqa: BLE001
+                    produced = None
+                if not produced or produced[0] == produced[1]:
+                    continue
+                patch = make_patch(path, produced[0], produced[1])
+                if patch:
+                    pieces.append(patch)
+                    used.append(path)
+                break
+        if len(pieces) < 2:
+            continue
+        serial += 1
+        commit_id = f"m{serial:04d}"
+        (commits / f"{commit_id}.patch").write_text("".join(pieces))
+        manifest[commit_id] = {"kind": "multi_file", "path": ",".join(used)}
     (EVAL / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
     shutil.copy(TESTS_JSON, EVAL / "tests.json")
     by_kind: dict[str, int] = {}
