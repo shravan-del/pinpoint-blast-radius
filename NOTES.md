@@ -230,3 +230,58 @@ coverage run will capture fixture reads.
   (the repo must stay under 20 MB and the checkout alone is 26 MB).
 - sqlglot's own `CLAUDE.md` / `AGENTS.md` are inside `vendor/sqlglot` and are
   instructions for sqlglot contributors. They do not apply to this project.
+
+## Phase 1 — Pack every test (2026-11-20)
+
+Still "run every test on every commit", so a miss remains impossible. The only
+change is how the tests are spread.
+
+```
+Simulated: 1104.510 s
+Misses:    0
+```
+
+105.960 s better than the starter, and exactly the predicted optimum for a
+selection of all 1620 tests.
+
+**The packer.** Longest test first onto the least loaded worker (LPT), repeated
+for every worker count 1..8, keeping the cheapest by the scorer's own formula
+(busiest worker + 2 s per occupied worker). On the full test set it chooses
+**k=4**: 28.817 s busiest + 8 s = 36.817 s/commit.
+
+```
+k=1 105.047   k=3  40.349   k=5  38.817   k=7  42.817
+k=2  55.524   k=4  36.817   k=6  40.817   k=8  44.817
+```
+
+k=4 wins because `test_max_nodes` alone is 28.817 s. No split can put the
+busiest worker below one test's duration, so past k=4 every extra worker is
+2 s of pure loss. That also means the k sweep is not a nicety: as the selection
+shrinks in Phase 2 the best k will move, and for a one-test selection it is k=1.
+
+Details that matter:
+
+- Packing is done in **integer milliseconds** with `math.floor(s*1000+0.5)`, the
+  same arithmetic as `score.py`, so our cost and the scorer's cost agree exactly.
+  A unit test checks the two rounding functions agree on 5000 values.
+- Ties break on the test number, so the output is byte-identical every run.
+- Empty workers are never emitted.
+- LPT plus the k sweep is not optimal in general (bin packing), but a unit test
+  confirms it matches exhaustive search on small awkward sets, and on the real
+  set it hits the information-theoretic floor of `max_test + 2k`.
+
+**CPU.** Measured under the scorer's own limits (`make cpu`): 0.72 s user+sys for
+3 runs, so **~0.24 s per run**, and that is under amd64 emulation on an Apple
+Silicon Mac, so real hardware will be lower. Against 1104.5 s of simulated time
+it is noise, but it is the budget Phase 2 has to spend its index loading from.
+
+**Fail-safe behaviour.** `selector.py` never raises. An unreadable `tests.json`
+still prints one `{"commit": ..., "workers": []}` line per commit rather than
+crashing, because a crash rejects the whole submission while misses only cost
+300 s each. A missing `/data` prints nothing and exits 0. Both are unit-tested.
+
+`BLAST_RADIUS_DATA` overrides `/data` so the unit tests and `make local` can run
+a batch without Docker. The scorer never sets it.
+
+**New make targets:** `make unit` (14 tests, standard library only),
+`make lint` (ruff), `make local` (score without a Docker build), `make cpu`.

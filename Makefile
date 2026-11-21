@@ -27,3 +27,26 @@ sample: build
 check: build
 	docker run $(RUN_FLAGS) $(IMAGE) > $(OUTPUT)
 	python3 score.py $(SAMPLE) $(SAMPLE)/answers.json $(OUTPUT) > /dev/null && echo "format ok"
+
+# --- Pinpoint's own targets -------------------------------------------------
+
+.PHONY: unit lint local cpu
+
+# Our unit tests.  They need nothing but the standard library.
+unit:
+	python3 -m unittest discover -s tests -t . -q
+
+lint:
+	ruff check . --exclude vendor
+
+# The selector run straight on the host against the sample batch: the same
+# numbers as `make sample` without a Docker build, for fast iteration.
+local:
+	BLAST_RADIUS_DATA=$(SAMPLE) python3 selector.py > $(OUTPUT)
+	python3 score.py $(SAMPLE) $(SAMPLE)/answers.json $(OUTPUT)
+
+# What the board will add to our simulated seconds: user+sys of every process
+# in the container, measured under the scorer's own limits.
+cpu: build
+	docker run $(RUN_FLAGS) --entrypoint sh $(IMAGE) -c \
+		'for i in 1 2 3; do python /app/selector.py > /dev/null; done; times' 2>&1 | tail -4
