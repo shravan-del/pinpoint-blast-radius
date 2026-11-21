@@ -577,6 +577,23 @@ def command_build(arguments: argparse.Namespace) -> int:
                 entry["classes"] = class_names
                 table_lines = astutil.table_entries(tree)
                 if table_lines:
+                    # Keep only the key forms the recorder actually saw on
+                    # this table.  The AST shows `exp.Div`; the recorder names
+                    # keys from runtime objects and a nested class comes out
+                    # as `t:Outer.Inner`.  If none of our guesses is a real
+                    # key of that table we have failed to name it, and
+                    # "nobody reads this key" would be a lie - so the entry is
+                    # dropped and the caller keeps the safe answer.
+                    known = _keys_of_table()
+                    module_name = _module_name(relative) or ""
+                    verified = {}
+                    for line, (table_name, forms) in table_lines.items():
+                        real = set(known.get(f"{module_name}:{table_name}", ()))
+                        kept = [f for f in forms if f in real]
+                        if kept:
+                            verified[line] = (table_name, kept)
+                    table_lines = verified
+                if table_lines:
                     forms_list: list[list] = []
                     index_of: dict[tuple, int] = {}
                     per_line_index = {}

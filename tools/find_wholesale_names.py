@@ -77,6 +77,30 @@ def main() -> int:
             tree = ast.parse(path.read_text("utf-8"))
         except (SyntaxError, UnicodeDecodeError):
             continue
+        # Any mention at definition time bars the table, not just a wholesale
+        # one.  generators/bigquery.py has
+        # `generator.AFTER_HAVING_MODIFIER_TRANSFORMS["qualify"]` in a class
+        # body: a single-key read, invisible to the recorder because it
+        # happens before anything can be wrapped, and deleting that entry
+        # changes a class attribute every test then uses.  Looking only for
+        # iteration and items() missed it, and the gate caught the miss.
+        for node in definition_time_nodes(tree):
+            if isinstance(node, ast.Subscript):
+                name = _name_of(node.value)
+                if name:
+                    found.add(name)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if node.func.attr in {"get", "pop", "setdefault"}:
+                    name = _name_of(node.func.value)
+                    if name:
+                        found.add(name)
+            if isinstance(node, ast.Compare):
+                for operator, comparator in zip(node.ops, node.comparators):
+                    if isinstance(operator, (ast.In, ast.NotIn)):
+                        name = _name_of(comparator)
+                        if name:
+                            found.add(name)
+
         for node in definition_time_nodes(tree):
             # X.items() / X.keys() / X.values() / X.copy() ...
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):

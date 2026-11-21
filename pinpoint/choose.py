@@ -210,21 +210,26 @@ def _for_modification(change, store, everything: int) -> int:
         changed, insertions = touched_old_lines(hunk)
         for line in changed:
             narrowed = None
-            if old_tree is not None and new_tree is not None:
-                # A table entry is identified by its key, so this does not
-                # need the name guard: a changed value cannot be reached
-                # except through that key.
-                narrowed = _table_entry_tests(path, line, store,
-                                              old_tree, new_tree)
-            if narrowed is not None:
-                pass
-            elif store.class_at(path, line) is not None and may_narrow:
+            if store.class_at(path, line) is not None and may_narrow:
                 narrowed = _class_body_tests(path, line, store)
             elif store.in_def_header(path, line) and may_narrow:
                 # A default argument is read when the function is called, so
                 # only a test that reached the body can notice the change.
                 narrowed = store.tests_for_block(path, line)
-            found |= store.tests_for_line(path, line) if narrowed is None else narrowed
+            if narrowed is None:
+                narrowed = store.tests_for_line(path, line)
+
+            if old_tree is not None and new_tree is not None:
+                # A table entry is identified by its key, so this does not
+                # need the name guard: a changed value is only reachable
+                # through that key.  Both answers are supersets of the truth,
+                # so taking whichever is smaller is still safe - and without
+                # this the key answer made 4d63 four times worse, because a
+                # common key is read by more tests than the class is used by.
+                by_key = _table_entry_tests(path, line, store, old_tree, new_tree)
+                if by_key is not None and by_key.bit_count() < narrowed.bit_count():
+                    narrowed = by_key
+            found |= narrowed
         for line in insertions:
             # The gap sits inside some statement - a multi-line signature, a
             # table literal - and inserting into it changes that statement.
