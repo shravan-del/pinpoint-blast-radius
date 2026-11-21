@@ -387,6 +387,28 @@ class SelectionTests(unittest.TestCase):
         patch = diff_for("tests/conftest.py", "", "x = 1\n", status="added")
         self.assertEqual(len(self.chosen(patch)), TEST_COUNT)
 
+    def test_new_pytest_configuration_selects_everything(self):
+        """None of these exist at the pinned commit, and each one changes how
+        pytest collects or runs every test in its scope."""
+        for name in ("pytest.ini", ".pytest.ini", "tox.ini",
+                     "sqlglot/conftest.py", "conftest.py"):
+            patch = diff_for(name, "", "[pytest]\n", status="added")
+            self.assertEqual(len(self.chosen(patch)), TEST_COUNT, name)
+
+    def test_changed_pytest_configuration_selects_everything(self):
+        for name in ("setup.cfg", "pyproject.toml"):
+            patch = diff_for(name, "a = 1\n", "a = 2\n")
+            self.assertEqual(len(self.chosen(patch)), TEST_COUNT, name)
+
+    def test_crlf_context_that_does_not_match_falls_back(self):
+        """A CRLF patch against an LF file cannot be applied, and an
+        unapplyable patch must raise so the caller runs everything."""
+        body = ("diff --git a/%s b/%s\n--- a/%s\n+++ b/%s\n"
+                "@@ -1,3 +1,3 @@\n" % ((MODULE,) * 4))
+        body += '\r\n'.join(['"""A module docstring."""', '-', '+', '']) 
+        with self.assertRaises(Exception):
+            choose.select(body, self.store)
+
     def test_an_unknown_file_selects_everything(self):
         patch = diff_for("some/unknown/place.py", "a\n", "b\n")
         self.assertEqual(len(self.chosen(patch)), TEST_COUNT)

@@ -96,6 +96,24 @@ def statement_owners(tree: ast.AST) -> dict[int, int]:
             if start is not None and end is not None:
                 claim(start, end, start)
 
+        # A lambda's body is its own scope.  It does not run when the
+        # statement around it runs - building the lambda does not call it -
+        # so changing it cannot alter which other lines of that statement
+        # execute, and the only tests it can reach are the ones that called
+        # it.  Without this, every lambda in a dialect table belongs to the
+        # one enormous assignment that defines the table, and editing one of
+        # them selects every importer.
+        if isinstance(node, ast.Lambda):
+            arguments = node.args
+            # A default argument IS evaluated when the lambda is built, so a
+            # lambda that has one is left alone rather than risk treating a
+            # default as deferred when it shares a line with the body.
+            if not (arguments.defaults or any(arguments.kw_defaults or ())):
+                start = getattr(node.body, "lineno", None)
+                end = getattr(node.body, "end_lineno", None)
+                if start is not None and end is not None:
+                    claim(start, end, start)
+
         for child in ast.iter_child_nodes(node):
             visit(child)
 

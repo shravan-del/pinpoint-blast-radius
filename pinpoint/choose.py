@@ -17,9 +17,20 @@ import ast
 from . import astutil
 from .diffparse import ADDED, DELETED, apply_hunks, parse_patch, touched_old_lines
 
-# There is no conftest.py anywhere at the pinned commit.  One appearing, or an
-# existing one changing, rewrites how pytest collects and runs everything.
-CONFTEST = "conftest.py"
+# Files that decide how pytest collects and configures the whole run.  There
+# is no conftest.py anywhere at the pinned commit, and no pytest.ini or
+# tox.ini either, so any of them appearing changes the rules for every test in
+# its scope.  pyproject.toml and setup.cfg do exist and every test opens them,
+# so the read map already answers for those; they are listed anyway so that
+# the answer does not depend on which map happens to cover them.
+COLLECTION_FILES = frozenset({
+    "conftest.py",
+    "pytest.ini",
+    ".pytest.ini",
+    "tox.ini",
+    "setup.cfg",
+    "pyproject.toml",
+})
 
 
 def _basename(path: str) -> str:
@@ -250,7 +261,8 @@ def _class_body_tests(path: str, line: int, store) -> int | None:
 
 
 def _for_change(change, store, everything: int) -> int:
-    if _basename(change.path) == CONFTEST or _basename(change.old_path or "") == CONFTEST:
+    if (_basename(change.path) in COLLECTION_FILES
+            or _basename(change.old_path or "") in COLLECTION_FILES):
         return everything
 
     if change.renamed:

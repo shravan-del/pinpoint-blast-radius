@@ -116,6 +116,48 @@ class TestStatementOwners(unittest.TestCase):
         self.assertEqual(found[2], 1)
         self.assertEqual(found[4], 4)
 
+    def test_a_lambda_body_is_its_own_scope(self):
+        """Building a lambda does not call it, so its body cannot change what
+        the statement around it does."""
+        found = owners("""
+            TABLE = {
+                "a": lambda x: f(x),
+                "b": 2,
+            }
+        """)
+        self.assertEqual(found[1], 1)   # the assignment
+        self.assertEqual(found[2], 2)   # the lambda body, on its own
+        self.assertEqual(found[3], 1)   # a plain entry, back to the assignment
+        # Note this buys little on sqlglot itself: a one-line
+        # `"k": lambda x: f(x)` puts the body on the same line as the dict
+        # entry, so that line's coverage mixes "built the lambda" with
+        # "called it" and the union is unchanged.
+
+    def test_a_multi_line_lambda_body_is_one_scope(self):
+        """The body starts where the expression starts, not at `lambda`.
+        The `lambda x: (` line builds the lambda, so it belongs to the
+        statement - which is the conservative answer and the right one."""
+        found = owners("""
+            TABLE = {
+                "a": lambda x: (
+                    x
+                    + 1
+                ),
+            }
+        """)
+        self.assertEqual(found[2], 1)
+        for line in (3, 4):
+            self.assertEqual(found[line], 3, line)
+
+    def test_a_lambda_with_a_default_is_left_alone(self):
+        """A default argument is evaluated when the lambda is built."""
+        found = owners("""
+            TABLE = {
+                "a": lambda x=expensive(): x,
+            }
+        """)
+        self.assertEqual(found[2], 1)
+
     def test_an_except_clause_is_anchored(self):
         found = owners("""
             try:
