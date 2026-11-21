@@ -9,3 +9,9 @@ __pycache__/
 .pytest_cache/
 # Local evaluation scratch (mutants, labels) - evaluation only, never shipped
 eval/
+
+# Planning and working notes: kept locally, not part of the entry
+CLAUDE.md
+KICKOFF_PROMPT.md
+NOTES.md
+SUBMISSIONS.md

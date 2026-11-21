@@ -11,7 +11,7 @@ make check    # output format only
 ```
 
 The starter kit's own README is kept at [docs/starter-kit-README.md](docs/starter-kit-README.md).
-Scoring rules: [SCORING.md](SCORING.md). Findings: [NOTES.md](NOTES.md). Submission log: [SUBMISSIONS.md](SUBMISSIONS.md).
+Scoring rules: [SCORING.md](SCORING.md).
 
 ## Third-party code
 
