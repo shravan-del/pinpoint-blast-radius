@@ -95,6 +95,8 @@ def _run_one(job: tuple) -> dict:
         environment["COVERAGE_FILE"] = str(directory / ".coverage")
     if mode == "classes":
         environment["PINPOINT_CLASSES"] = "1"
+    if mode == "tables":
+        environment["PINPOINT_TABLES"] = "1"
     environment["PINPOINT_AUDIT_DIR"] = str(directory)
     environment["PINPOINT_REPO_ROOT"] = str(SQLGLOT_ROOT)
     environment["SKIP_INTEGRATION"] = "0"
@@ -126,6 +128,8 @@ def _run_one(job: tuple) -> dict:
         tail = "TIMEOUT"
     elapsed = time.monotonic() - started
 
+    table_reads: dict[str, list] = {}   # table id -> the keys this test read
+
     # Merge every coverage data file the test and its children wrote.
     lines: dict[str, list[int]] = {}
     root_prefix = str(SQLGLOT_ROOT).rstrip("/") + "/"
@@ -143,6 +147,15 @@ def _run_one(job: tuple) -> dict:
             if found:
                 lines.setdefault(relative, []).extend(found)
     lines = {path: sorted(set(numbers)) for path, numbers in sorted(lines.items())}
+
+    for dump in sorted(directory.glob("tables-*.json.gz")):
+        try:
+            with gzip.open(dump, "rt", encoding="utf-8") as handle:
+                for table, keys in json.load(handle).items():
+                    merged = set(table_reads.get(table, ())) | set(keys)
+                    table_reads[table] = sorted(merged)
+        except Exception:  # noqa: BLE001
+            pass
 
     reads: set[str] = set()       # opened as data
     import_reads: set[str] = set()  # opened by the import machinery
@@ -168,6 +181,7 @@ def _run_one(job: tuple) -> dict:
             elif line.startswith("U "):
                 untrackable.add(line[2:])
 
+
     result = {
         "number": number,
         "id": node_id,
@@ -179,12 +193,15 @@ def _run_one(job: tuple) -> dict:
         "imports": sorted(imports),
         "scans": sorted(scans),
         "used_classes": sorted(used_classes),
+        "table_reads": table_reads,
+        "table_dump_found": bool(table_reads),
         "trackable": sorted(trackable),
         "untrackable": sorted(untrackable),
         "tail": "" if exit_code == 0 else tail,
     }
 
-    out_names = {"coverage": "tests", "reads": "reads", "classes": "classes"}
+    out_names = {"coverage": "tests", "reads": "reads", "classes": "classes",
+                 "tables": "tables"}
     target = WORK / out_names[mode] / f"{number}.json.gz"
     target.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(target, "wt", encoding="utf-8") as handle:
@@ -207,7 +224,8 @@ def _run_one(job: tuple) -> dict:
 
 def command_run(arguments: argparse.Namespace) -> int:
     mode = arguments.mode
-    out_name = {"coverage": "tests", "reads": "reads", "classes": "classes"}[mode]
+    out_name = {"coverage": "tests", "reads": "reads", "classes": "classes",
+                "tables": "tables"}[mode]
     tests = _read_tests()
     if arguments.only:
         wanted = set(arguments.only)
@@ -301,6 +319,78 @@ def _runs(per_line: dict[int, int], line_count: int) -> list[list[int]]:
     return encoded
 
 
+def _barred_tables() -> tuple[set[str], set[str]]:
+    """Tables that must never be narrowed by key.
+
+    Two sources, both needed:
+
+      * tables read while sqlglot was being imported, found by instrumenting
+        the import one module at a time;
+      * attribute names read as a whole at *definition* time, found
+        statically - `required_args = {k for k, v in cls.arg_types.items()}`
+        runs in __init_subclass__ before anything can be wrapped, and
+        `new_trie(TIME_MAPPING)` derives a differently-keyed structure inside
+        a function where the table's own name never appears.
+
+    Without these, a change to one entry could reach a test through the
+    derived structure while that test never looked the key up, and we would
+    drop it.
+    """
+    read_during_import: set[str] = set()
+    names: set[str] = set()
+    try:
+        read_during_import = set(json.loads(
+            (WORK / "table_import_reads.json").read_text("utf-8")
+        )["read_during_import"])
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        names = set(json.loads(
+            (WORK / "table_wholesale_names.json").read_text("utf-8")
+        )["wholesale_names"])
+    except Exception:  # noqa: BLE001
+        pass
+    return read_during_import, names
+
+
+def _keys_of_table() -> dict[str, list[str]]:
+    path = WORK / "table_origins.json"
+    try:
+        return json.loads(path.read_text("utf-8"))["keys_of_table"]
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _wholesale_by_key(wholesale_readers, keys_of_table) -> dict[str, set[int]]:
+    by_key: dict[str, set[int]] = {}
+    for table_id, numbers in wholesale_readers.items():
+        for key in keys_of_table.get(table_id, ()):
+            by_key.setdefault(key, set()).update(numbers)
+    return by_key
+
+
+def _narrowable_tables(candidates: set[str]) -> set[str]:
+    read_during_import, names = _barred_tables()
+    kept = set()
+    for table_id in candidates:
+        if table_id in read_during_import:
+            continue
+        attribute = table_id.rsplit(".", 1)[-1] if "." in table_id.split(":", 1)[-1] \
+            else table_id.split(":", 1)[-1]
+        if attribute in names:
+            continue
+        kept.add(table_id)
+    return kept
+
+
+def _wrapped_tables() -> set[str]:
+    path = WORK / "table_origins.json"
+    try:
+        return set(json.loads(path.read_text("utf-8"))["keys_of_table"])
+    except Exception:  # noqa: BLE001
+        return set()
+
+
 def command_build(arguments: argparse.Namespace) -> int:
     tests = _read_tests()
     test_count = len(tests)
@@ -318,6 +408,11 @@ def command_build(arguments: argparse.Namespace) -> int:
     trackable_classes: set[str] = set()
     untrackable_classes: set[str] = set()
     have_class_pass = False
+    key_readers: dict[str, set[int]] = {}        # key form -> tests that read it
+    wholesale_readers: dict[str, set[int]] = {}  # table -> tests that read it whole
+    no_table_dump: set[int] = set()              # no record: assume it reads all
+    tables_seen: set[str] = set()                # tables the recorder wrapped
+    have_table_pass = False
     missing: list[int] = []
     failed: list[dict] = []
 
@@ -340,6 +435,25 @@ def command_build(arguments: argparse.Namespace) -> int:
             module_tests.setdefault(path, set()).add(number)
         for module in record["imports"]:
             importers.setdefault(module, set()).add(number)
+
+        tables_path = WORK / "tables" / f"{number}.json.gz"
+        if tables_path.exists():
+            with gzip.open(tables_path, "rt", encoding="utf-8") as handle:
+                tables_record = json.load(handle)
+            reads_by_table = tables_record.get("table_reads") or {}
+            if reads_by_table:
+                have_table_pass = True
+                for table_id, keys in reads_by_table.items():
+                    tables_seen.add(table_id)
+                    if "*" in keys:
+                        wholesale_readers.setdefault(table_id, set()).add(number)
+                    else:
+                        for key in keys:
+                            key_readers.setdefault(key, set()).add(number)
+            else:
+                no_table_dump.add(number)
+        else:
+            no_table_dump.add(number)
 
         classes_path = WORK / "classes" / f"{number}.json.gz"
         if classes_path.exists():
@@ -461,6 +575,22 @@ def command_build(arguments: argparse.Namespace) -> int:
                 class_names = sorted(set(in_class.values()))
                 class_index = {name: i for i, name in enumerate(class_names)}
                 entry["classes"] = class_names
+                table_lines = astutil.table_entries(tree)
+                if table_lines:
+                    forms_list: list[list] = []
+                    index_of: dict[tuple, int] = {}
+                    per_line_index = {}
+                    for line, (table_name, forms) in table_lines.items():
+                        signature = (table_name, tuple(forms))
+                        position = index_of.get(signature)
+                        if position is None:
+                            position = len(forms_list)
+                            index_of[signature] = position
+                            forms_list.append([table_name, forms])
+                        per_line_index[line] = position
+                    entry["table_entries"] = forms_list
+                    entry["table_runs"] = _runs(per_line_index, line_count)
+
                 safe_to_narrow = astutil.narrowable_class_lines(tree)
                 entry["def_headers"] = _runs(
                     dict.fromkeys(astutil.narrowable_def_headers(tree), 1),
@@ -621,6 +751,21 @@ def command_build(arguments: argparse.Namespace) -> int:
     archive_path = OUT / "maps.zip"
     with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         archive.writestr("meta.json", json.dumps(meta, separators=(",", ":")))
+        archive.writestr("table_keys.json", json.dumps({
+            "key_readers": {k: bitsets.add(v) for k, v in sorted(key_readers.items())},
+            # Keyed by KEY, not by table: a change to one entry needs the
+            # tests that read some table containing that key from end to end,
+            # and "read any table whole" would be nearly every test.
+            "wholesale": {k: bitsets.add(v)
+                          for k, v in sorted(_wholesale_by_key(
+                              wholesale_readers, _keys_of_table()).items())},
+            "no_dump": bitsets.add(no_table_dump) if no_table_dump else -1,
+            # Every table the recorder wrapped, not just the ones some test
+            # read: "nobody read this table" and "we never wrapped it" are
+            # very different answers and only the first allows narrowing.
+            "tracked": sorted(_narrowable_tables(tables_seen | _wrapped_tables())),
+            "have_table_pass": have_table_pass,
+        }, separators=(",", ":")))
         archive.writestr("repo_paths.txt", "\n".join(repo_paths))
         archive.writestr(
             "groups.bin",
@@ -637,6 +782,13 @@ def command_build(arguments: argparse.Namespace) -> int:
           f"{len(bitsets.table) * bitsets.width / 1e6:.1f} MB raw", file=sys.stderr)
     print(f"files mapped: {len(entries)}, sources bundled: {len(sources)}",
           file=sys.stderr)
+    _barred_import, _barred_names = _barred_tables()
+    print(f"tables barred from key narrowing: {len(_barred_import)} read during "
+          f"import, {len(_barred_names)} names read whole at definition time",
+          file=sys.stderr)
+    print(f"table pass: {have_table_pass}, {len(key_readers)} keys read, "
+          f"{len(wholesale_readers)} tables read whole, "
+          f"{len(no_table_dump)} tests with no table record", file=sys.stderr)
     print(f"class-usage pass: {have_class_pass}, {len(class_user_groups)} classes used, "
           f"{len(untrackable_classes - trackable_classes)} untrackable, "
           f"{len(name_reference_groups)} names referenced", file=sys.stderr)
@@ -661,11 +813,13 @@ def main(argv: list[str]) -> int:
     runner.add_argument("--only", nargs="*", help="test numbers or node ids")
     runner.add_argument("--resume", action="store_true",
                         help="skip tests already recorded")
-    runner.add_argument("--mode", choices=("coverage", "reads", "classes"),
+    runner.add_argument("--mode",
+                        choices=("coverage", "reads", "classes", "tables"),
                         default="coverage",
                         help="coverage: the line map.  reads: data reads and "
                              "directory scans, without coverage in the way.  "
-                             "classes: which classes each test actually built")
+                             "classes: which classes each test actually built.  "
+                             "tables: which keys of the big dialect tables it read")
     runner.set_defaults(func=command_run)
 
     builder = sub.add_parser("build", help="build the shipped maps")

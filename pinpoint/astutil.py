@@ -436,3 +436,94 @@ def added_statements_are_inert(old_tree: ast.AST, new_tree: ast.AST) -> bool:
             if node.name in taken:
                 return False
     return True
+
+
+def _key_forms(node: ast.AST) -> list[str] | None:
+    """How a dict key written in source could appear as a recorded key.
+
+    The recorder sees runtime objects and names them by type: a string key is
+    `s:text`, a class is `t:QualName`, an enum member is `e:NAME`, a number is
+    `n:repr`.  Source only shows `exp.Div` or `"VARCHAR"`, so where the kind
+    is ambiguous every plausible form is returned and the caller unions them.
+    None means we cannot name the key at all, and the caller must not narrow.
+    """
+    if isinstance(node, ast.Constant):
+        value = node.value
+        if isinstance(value, str):
+            return ["s:" + value]
+        if isinstance(value, (bool, int, float)):
+            return ["n:" + repr(value)]
+        return None
+    name = None
+    if isinstance(node, ast.Attribute):
+        name = node.attr
+    elif isinstance(node, ast.Name):
+        name = node.id
+    if name is None:
+        return None
+    return ["t:" + name, "e:" + name, "s:" + name]
+
+
+def table_entries(tree: ast.AST) -> dict[int, tuple[str, list[str]]]:
+    """Map lines of a table literal to the entry, or entries, they define.
+
+    A table is a dict literal bound to a module global or a class attribute,
+    which is how the recorder names them, so the ids line up.  Several entries
+    can share a line - `{"x": 1, "u": 2}` - and a change to that line could be
+    to any of them, so their key forms are unioned.
+    """
+    per_line: dict[int, tuple[str, set[str]]] = {}
+
+    def record(table_name: str, dict_node: ast.Dict) -> None:
+        for key, value in zip(dict_node.keys, dict_node.values):
+            if key is None:          # `**spread`: not one entry, skip it
+                continue
+            forms = _key_forms(key)
+            if forms is None:
+                continue
+            start = min(getattr(key, "lineno", 10**9),
+                        getattr(value, "lineno", 10**9))
+            end = max(getattr(key, "end_lineno", 0) or 0,
+                      getattr(value, "end_lineno", 0) or 0)
+            if start > end:
+                continue
+            for line in range(start, end + 1):
+                held = per_line.get(line)
+                if held is None or held[0] != table_name:
+                    per_line[line] = (table_name, set(forms))
+                else:
+                    held[1].update(forms)
+
+    def assignments(body, prefix: str) -> None:
+        for statement in body:
+            if isinstance(statement, ast.Assign):
+                targets, value = statement.targets, statement.value
+            elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+                targets, value = [statement.target], statement.value
+            else:
+                continue
+            if not isinstance(value, ast.Dict):
+                continue
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    record(f"{prefix}{target.id}", value)
+
+    assignments(getattr(tree, "body", []), "")
+
+    def classes(node: ast.AST, prefix: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                qualified = f"{prefix}{child.name}"
+                assignments(child.body, qualified + ".")
+                classes(child, qualified + ".")
+
+    classes(tree, "")
+    return {line: (name, sorted(forms)) for line, (name, forms) in per_line.items()}
+
+
+def table_keys_of(tree: ast.AST) -> dict[str, set[str]]:
+    """Every key form each table literal in this file defines."""
+    found: dict[str, set[str]] = {}
+    for table_name, forms in table_entries(tree).values():
+        found.setdefault(table_name, set()).update(forms)
+    return found

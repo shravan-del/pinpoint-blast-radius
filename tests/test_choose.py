@@ -67,6 +67,27 @@ def names_it():
     return Widget.TABLE
 '''
 
+TABLE_SOURCE = '''\
+TABLE_A = {
+    "alpha": 1,
+    "beta": 2,
+    "delta": 4,
+}
+
+
+class Holder:
+    MAP = {
+        "gamma": 3,
+    }
+
+
+UNTRACKED = {
+    "zeta": 9,
+}
+'''
+
+TABLE_MODULE = "sqlglot/tables.py"
+
 DATA_FILE = "tests/fixtures/thing.sql"
 MODULE = "sqlglot/thing.py"
 TEST_FILE = "tests/test_thing.py"
@@ -186,7 +207,16 @@ def build_store(tmp: Path) -> MapStore:
         "name_refs": {"Widget": builder.add({3})},
         "untrackable_classes": ["sqlglot.widget:Widget.Inner"],
     }
-    repo_paths = [MODULE, DATA_FILE, TEST_FILE, CLASS_MODULE, "README.md",
+    table_keys = {
+        "key_readers": {"s:alpha": builder.add({0}), "s:beta": builder.add({1}),
+                        "s:gamma": builder.add({2}),
+                        "s:renamed": builder.add({4})},
+        "wholesale": {"s:delta": builder.add({3})},
+        "no_dump": builder.add({7}),
+        "tracked": ["sqlglot.tables:TABLE_A", "sqlglot.tables:Holder.MAP"],
+        "have_table_pass": True,
+    }
+    repo_paths = [MODULE, DATA_FILE, TEST_FILE, CLASS_MODULE, TABLE_MODULE, "README.md",
                   "sqlglot/typing/__init__.py"]
 
     # A second module with a class body, for the class-usage rule.
@@ -256,6 +286,31 @@ def build_store(tmp: Path) -> MapStore:
         "own_tests": -1,
     }
 
+    # A module of lookup tables, for the key-level rule.
+    ttree = ast.parse(TABLE_SOURCE)
+    tlines = len(TABLE_SOURCE.splitlines())
+    per_line = astutil.table_entries(ttree)
+    forms_list, index_of, per_line_index = [], {}, {}
+    for line, (table_name, forms) in per_line.items():
+        signature = (table_name, tuple(forms))
+        if signature not in index_of:
+            index_of[signature] = len(forms_list)
+            forms_list.append([table_name, forms])
+        per_line_index[line] = index_of[signature]
+    table_entry = {
+        "sha256": "t", "lines": tlines,
+        "ast": astutil.fingerprint(TABLE_SOURCE),
+        "runs": runs({line: builder.add(importers) for line in range(1, tlines + 1)}),
+        "block_runs": runs({}),
+        "def_headers": runs({}),
+        "table_entries": forms_list,
+        "table_runs": runs(per_line_index),
+        "module": builder.add(importers),
+        "openers": -1,
+        "importers": builder.add(importers),
+        "own_tests": -1,
+    }
+
     path = tmp / "maps.zip"
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("meta.json", json.dumps(meta))
@@ -266,6 +321,9 @@ def build_store(tmp: Path) -> MapStore:
         archive.writestr("f/" + TEST_FILE + ".json", json.dumps(test_entry))
         archive.writestr("src/" + MODULE, MODULE_SOURCE)
         archive.writestr("f/" + CLASS_MODULE + ".json", json.dumps(class_entry))
+        archive.writestr("f/" + TABLE_MODULE + ".json", json.dumps(table_entry))
+        archive.writestr("src/" + TABLE_MODULE, TABLE_SOURCE)
+        archive.writestr("table_keys.json", json.dumps(table_keys))
         archive.writestr("src/" + CLASS_MODULE, CLASS_SOURCE)
         archive.writestr("src/" + TEST_FILE, "x = 1\n")
     return MapStore(path)
@@ -510,6 +568,35 @@ class SelectionTests(unittest.TestCase):
         new = MODULE_SOURCE.replace("def used(value, extra=True):",
                                     "def used(value, other=True):")
         self.assertEqual(self.chosen(diff_for(MODULE, MODULE_SOURCE, new)),
+                         [0, 1, 2, 3])
+
+    # -- the key-level table rule ------------------------------------------
+
+    def test_a_table_value_selects_only_the_readers_of_that_key(self):
+        new = TABLE_SOURCE.replace('"beta": 2,', '"beta": 22,')
+        # test 1 read s:beta; test 7 has no table record at all.
+        self.assertEqual(self.chosen(diff_for(TABLE_MODULE, TABLE_SOURCE, new)),
+                         [1, 7])
+
+    def test_a_table_in_a_class_body_works_too(self):
+        new = TABLE_SOURCE.replace('"gamma": 3,', '"gamma": 33,')
+        self.assertEqual(self.chosen(diff_for(TABLE_MODULE, TABLE_SOURCE, new)),
+                         [2, 7])
+
+    def test_reading_a_table_whole_counts_for_every_key_in_it(self):
+        new = TABLE_SOURCE.replace('"delta": 4,', '"delta": 44,')
+        self.assertEqual(self.chosen(diff_for(TABLE_MODULE, TABLE_SOURCE, new)),
+                         [3, 7])
+
+    def test_a_renamed_key_selects_readers_of_both_names(self):
+        """Including whoever looked the new name up and found nothing."""
+        new = TABLE_SOURCE.replace('"alpha": 1,', '"renamed": 1,')
+        self.assertEqual(self.chosen(diff_for(TABLE_MODULE, TABLE_SOURCE, new)),
+                         [0, 4, 7])
+
+    def test_an_untracked_table_does_not_narrow(self):
+        new = TABLE_SOURCE.replace('"zeta": 9,', '"zeta": 99,')
+        self.assertEqual(self.chosen(diff_for(TABLE_MODULE, TABLE_SOURCE, new)),
                          [0, 1, 2, 3])
 
     def test_several_files_union(self):

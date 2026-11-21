@@ -22,6 +22,7 @@ class MapStore:
         self._entries: dict[str, dict | None] = {}
         self._groups: bytes | None = None
         self._repo_paths: frozenset[str] | None = None
+        self._table_keys: dict | None = None
         self._names = set(self._zip.namelist())
 
     # -- lazy pieces -------------------------------------------------------
@@ -133,6 +134,49 @@ class MapStore:
     def tests_defined_in(self, path: str) -> int:
         """Tests that live in this file, whether or not they ran its lines."""
         return self._field(path, "own_tests")
+
+    @property
+    def table_keys(self) -> dict:
+        """The key-read maps.  Its own entry: most commits never need it."""
+        if self._table_keys is None:
+            if "table_keys.json" in self._names:
+                self._table_keys = json.loads(self._zip.read("table_keys.json"))
+            else:
+                self._table_keys = {"key_readers": {}, "wholesale": {},
+                                    "no_dump": EMPTY, "tracked": [],
+                                    "have_table_pass": False}
+            self._table_keys["tracked"] = set(self._table_keys.get("tracked", ()))
+        return self._table_keys
+
+    @property
+    def has_table_map(self) -> bool:
+        return bool(self.table_keys.get("have_table_pass"))
+
+    def table_entry_at(self, path: str, line: int):
+        """(table name, key forms) when this line defines a table entry."""
+        entry = self.entry(path)
+        if not entry:
+            return None
+        index = self._run_value(entry.get("table_runs", []), line)
+        if index < 0:
+            return None
+        found = entry.get("table_entries", [])
+        if index >= len(found):
+            return None
+        return found[index][0], found[index][1]
+
+    def table_is_tracked(self, table_id: str) -> bool:
+        return table_id in self.table_keys["tracked"]
+
+    def tests_reading_key(self, key: str) -> int:
+        return self.group(self.table_keys["key_readers"].get(key, EMPTY))
+
+    def tests_reading_whole_for_key(self, key: str) -> int:
+        """Tests that read some table holding this key from end to end."""
+        return self.group(self.table_keys["wholesale"].get(key, EMPTY))
+
+    def tests_without_table_record(self) -> int:
+        return self.group(self.table_keys.get("no_dump", EMPTY))
 
     def class_at(self, path: str, line: int) -> str | None:
         """The class whose body this line belongs to, if it is not in a method."""

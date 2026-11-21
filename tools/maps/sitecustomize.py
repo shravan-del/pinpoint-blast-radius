@@ -243,15 +243,35 @@ if _AUDIT_DIR and _ROOT:
                 original_exec = loader.exec_module
 
                 def exec_module(module, _original=original_exec):
-                    _original(module)
+                    if _tabletrack is not None:
+                        _tabletrack.IMPORTING += 1
+                    try:
+                        _original(module)
+                    finally:
+                        if _tabletrack is not None:
+                            _tabletrack.IMPORTING -= 1
                     try:
                         _instrument(module)
                     except Exception:  # noqa: BLE001
                         pass
+                    if _tabletrack is not None:
+                        try:
+                            _tabletrack.install(module)
+                        except Exception:  # noqa: BLE001
+                            pass
 
                 loader.exec_module = exec_module
                 return spec
             return None
 
-    if os.environ.get("PINPOINT_CLASSES"):
+    _tabletrack = None
+    if os.environ.get("PINPOINT_TABLES"):
+        try:
+            import tabletrack as _tabletrack
+
+            _tabletrack.arm(os.path.join(_AUDIT_DIR, f"tables-{os.getpid()}.json.gz"))
+        except Exception:  # noqa: BLE001
+            _tabletrack = None
+
+    if os.environ.get("PINPOINT_CLASSES") or os.environ.get("PINPOINT_TABLES"):
         sys.meta_path.insert(0, _Finder())

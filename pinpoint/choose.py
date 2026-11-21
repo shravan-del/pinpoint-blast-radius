@@ -139,6 +139,12 @@ def _for_modification(change, store, everything: int) -> int:
     # the inert-addition check, or the name guard that the class-body and
     # signature rules depend on.
     wants_old = not removes_anything
+    if not wants_old and store.has_table_map:
+        for hunk in change.hunks:
+            changed, _ = touched_old_lines(hunk)
+            if any(store.table_entry_at(path, line) is not None for line in changed):
+                wants_old = True
+                break
     if not wants_old and store.has_class_map:
         for hunk in change.hunks:
             changed, _ = touched_old_lines(hunk)
@@ -204,7 +210,15 @@ def _for_modification(change, store, everything: int) -> int:
         changed, insertions = touched_old_lines(hunk)
         for line in changed:
             narrowed = None
-            if store.class_at(path, line) is not None and may_narrow:
+            if old_tree is not None and new_tree is not None:
+                # A table entry is identified by its key, so this does not
+                # need the name guard: a changed value cannot be reached
+                # except through that key.
+                narrowed = _table_entry_tests(path, line, store,
+                                              old_tree, new_tree)
+            if narrowed is not None:
+                pass
+            elif store.class_at(path, line) is not None and may_narrow:
                 narrowed = _class_body_tests(path, line, store)
             elif store.in_def_header(path, line) and may_narrow:
                 # A default argument is read when the function is called, so
@@ -223,6 +237,49 @@ def _for_modification(change, store, everything: int) -> int:
                 found |= store.tests_in_module(path)
     return found
 
+
+
+def _table_entry_tests(path, line, store, old_tree, new_tree) -> int | None:
+    """Tests a change to one entry of a lookup table could reach.
+
+    A dialect table is built once, at import, by every importer, so line
+    coverage says only "everyone".  What separates them is which key a test
+    looks up, and the consumers are ordinary lookups
+    (`self.TRANSFORMS.get(...)`, `self.expression_metadata.get(...)`) that a
+    recording dict sees.
+
+    Three things are unioned: the tests that read this key from any table -
+    a dialect inherits entries by `{**PARENT}`, so scoping by key rather than
+    by table is the superset that covers the copies - the tests that read some
+    table holding the key from end to end, and the tests we have no record
+    for at all.  Returns None when the evidence does not apply.
+    """
+    if not store.has_table_map:
+        return None
+    found = store.table_entry_at(path, line)
+    if found is None:
+        return None
+    table_name, forms = found
+    module = _module_name(path)
+    if module is None or not store.table_is_tracked(f"{module}:{table_name}"):
+        return None
+    try:
+        old_keys = astutil.table_keys_of(old_tree).get(table_name)
+        new_keys = astutil.table_keys_of(new_tree).get(table_name)
+    except Exception:  # noqa: BLE001
+        return None
+    if old_keys is None or new_keys is None:
+        return None            # the table moved or vanished; do not guess
+
+    # The entry on this line, plus every key the edit added or removed, so a
+    # renamed key selects whoever looked up either name - including the
+    # lookups that found nothing, which the recorder also saw.
+    keys = set(forms) | (old_keys ^ new_keys)
+    reached = store.tests_without_table_record()
+    for key in keys:
+        reached |= store.tests_reading_key(key)
+        reached |= store.tests_reading_whole_for_key(key)
+    return reached
 
 
 def _class_body_tests(path: str, line: int, store) -> int | None:
