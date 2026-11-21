@@ -66,6 +66,18 @@ class TestPack(unittest.TestCase):
             self.assertLessEqual(len(workers), selector.MAXIMUM_WORKERS)
             self.assertTrue(all(workers), f"empty worker for size {size}")
 
+    def test_tests_that_round_to_zero_still_cost_a_worker(self):
+        """score.py drops empty workers, not cheap ones.  Reading it as
+        "load > 0" raised on max() of an empty sequence."""
+        durations = {0: 0, 1: 0, 2: 0}
+        workers = selector.pack([0, 1, 2], durations)
+        self.assertEqual(len(workers), 1)
+        self.assertEqual(sorted(n for w in workers for n in w), [0, 1, 2])
+        self.assertEqual(cost_of(workers, durations), selector.WORKER_COST_MILLISECONDS)
+
+    def test_a_single_zero_duration_test(self):
+        self.assertEqual(selector.pack([5], {5: 0}), [[5]])
+
     def test_is_deterministic(self):
         durations = {number: (number * 17) % 23 + 1 for number in range(40)}
         first = selector.pack(list(durations), durations)

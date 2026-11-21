@@ -65,11 +65,16 @@ def pack(test_numbers: list[int], durations: dict[int, int]) -> list[list[int]]:
             workers[lightest].append(number)
             loads[lightest] += durations[number]
 
-        occupied = [load for load in loads if load > 0]
-        cost = max(occupied) + WORKER_COST_MILLISECONDS * len(occupied)
+        # A worker counts because it has a test, not because that test takes
+        # time.  score.py drops *empty* workers; a worker holding only tests
+        # that round to 0 ms is still a worker and still costs 2 s.  Reading
+        # this as "load > 0" both mis-costed that case and raised on max() of
+        # an empty sequence.
+        used = [index for index, worker in enumerate(workers) if worker]
+        cost = max(loads[index] for index in used) + WORKER_COST_MILLISECONDS * len(used)
         if best_cost < 0 or cost < best_cost:
             best_cost = cost
-            best_workers = [worker for worker in workers if worker]
+            best_workers = [workers[index] for index in used]
 
         # More workers than tests cannot help, and neither can more workers
         # once one test alone already sets the busiest load.

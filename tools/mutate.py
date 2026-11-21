@@ -498,14 +498,33 @@ SUMMARY_FILE = re.compile(r"(tests/\S+?\.py)")
 
 
 def _patched_paths(patch_text: str) -> list[str]:
-    """The files a patch touches, read straight off its headers."""
+    """The files a patch touches, read straight off its headers.
+
+    Both sides matter: a deletion has `+++ /dev/null`, so looking only at the
+    new side finds nothing and the "did the mutation land" check wrongly
+    rejects every deleted-file mutant.
+    """
     found = []
     for line in patch_text.split("\n"):
-        if line.startswith("+++ "):
+        if line.startswith(("+++ ", "--- ")):
             name = line[4:].strip()
             if name != "/dev/null":
                 found.append(name[2:] if name.startswith(("a/", "b/")) else name)
     return found
+
+
+def _run_suite(work: Path, environment: dict, parallel: list) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "--no-header", "-p", "no:cacheprovider",
+         "-rfE", "--tb=no", "--timeout", "300",
+         # Without this, one un-importable test file aborts the whole run
+         # ("Interrupted: 1 error during collection") and nothing else is
+         # executed, so a syntax-error mutant would be labeled with only the
+         # collection error and every other test left unknown.
+         "--continue-on-collection-errors",
+         *parallel, "tests"],
+        cwd=str(work), env=environment, capture_output=True, text=True, timeout=1200,
+    )
 
 
 def _label_one(job: tuple) -> dict:
@@ -565,17 +584,14 @@ def _label_one(job: tuple) -> dict:
     # Serially the pinned checkout is 1620 passed, 0 failed, in 87 s.
     parallel = ["-n", str(jobs)] if jobs > 1 else []
     started = time.monotonic()
-    finished = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "--no-header", "-p", "no:cacheprovider",
-         "-rfE", "--tb=no", "--timeout", "300",
-         # Without this, one un-importable test file aborts the whole run
-         # ("Interrupted: 1 error during collection") and nothing else is
-         # executed, so a syntax-error mutant would be labeled with only the
-         # collection error and every other test left unknown.
-         "--continue-on-collection-errors",
-         *parallel, "tests"],
-        cwd=str(work), env=environment, capture_output=True, text=True, timeout=3600,
-    )
+    try:
+        finished = _run_suite(work, environment, parallel)
+    except subprocess.TimeoutExpired:
+        # A mutant that hangs the whole suite is a real outcome, but it is not
+        # a label: we never learn which tests failed.  Record it as a problem
+        # rather than letting the exception take the whole run down.
+        shutil.rmtree(work, ignore_errors=True)
+        return {"commit": commit_id, "error": "suite timed out", "detail": ""}
     elapsed = time.monotonic() - started
 
     failing: set[str] = set()
@@ -601,20 +617,31 @@ def _label_one(job: tuple) -> dict:
     # themselves costs a few seconds and removes the doubt; an under-reported
     # failure here would quietly excuse a real miss.
     for node_id in LOAD_SENSITIVE:
-        lone = subprocess.run(
-            [sys.executable, "-m", "pytest", "-q", "--no-header",
-             "-p", "no:cacheprovider", "-rfE", "--tb=no", "--timeout", "300", node_id],
-            cwd=str(work), env=environment, capture_output=True, text=True, timeout=1800,
-        )
+        try:
+            lone = subprocess.run(
+                [sys.executable, "-m", "pytest", "-q", "--no-header",
+                 "-p", "no:cacheprovider", "-rfE", "--tb=no", "--timeout", "300",
+                 node_id],
+                cwd=str(work), env=environment, capture_output=True, text=True,
+                timeout=900,
+            )
+        except subprocess.TimeoutExpired:
+            failing.add(node_id)
+            continue
         if lone.returncode == 1:
             failing.add(node_id)
-        elif lone.returncode != 0:
+        elif lone.returncode == 0:
+            failing.discard(node_id)
+        elif node_id.split("::")[0] in broken_files or lone.returncode in (2, 4):
+            # The file cannot be collected at all, which is the mutation doing
+            # its job: the full run already recorded the whole file as broken,
+            # so leave that verdict alone rather than discarding the mutant.
+            pass
+        else:
             shutil.rmtree(work, ignore_errors=True)
             return {"commit": commit_id,
                     "error": f"re-run of {node_id} exited {lone.returncode}",
                     "detail": (lone.stdout or "")[-400:]}
-        else:
-            failing.discard(node_id)
 
     shutil.rmtree(work, ignore_errors=True)
 
@@ -665,7 +692,13 @@ def command_label(arguments: argparse.Namespace) -> int:
         futures = [pool.submit(_label_one, (p.stem, str(p.resolve()), arguments.jobs))
                    for p in patches]
         for future in as_completed(futures):
-            result = future.result()
+            try:
+                result = future.result()
+            except Exception as error:  # noqa: BLE001
+                done += 1
+                problems.append({"commit": "?", "error": repr(error)[:300]})
+                print(f"  a mutant blew up: {error!r}", file=sys.stderr)
+                continue
             done += 1
             commit_id = result["commit"]
             if "error" in result:
