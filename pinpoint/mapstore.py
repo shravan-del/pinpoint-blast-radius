@@ -134,6 +134,44 @@ class MapStore:
         """Tests that live in this file, whether or not they ran its lines."""
         return self._field(path, "own_tests")
 
+    def class_at(self, path: str, line: int) -> str | None:
+        """The class whose body this line belongs to, if it is not in a method."""
+        entry = self.entry(path)
+        if not entry:
+            return None
+        index = self._run_value(entry.get("class_runs", []), line)
+        if index < 0:
+            return None
+        names = entry.get("classes", [])
+        return names[index] if index < len(names) else None
+
+    def tests_running_methods_of(self, path: str, qualified: str) -> int:
+        """Tests that ran a method defined directly in this class."""
+        entry = self.entry(path)
+        if not entry:
+            return 0
+        names = entry.get("classes", [])
+        if qualified not in names:
+            return 0
+        groups = entry.get("class_methods", [])
+        index = names.index(qualified)
+        return self.group(groups[index]) if index < len(groups) else 0
+
+    def tests_using_class(self, label: str) -> int:
+        """Tests that built an instance of a class with this one in its MRO."""
+        return self.group(self.meta.get("class_users", {}).get(label, EMPTY))
+
+    def tests_naming(self, name: str) -> int:
+        """Tests that ran a line mentioning this name anywhere in the repo."""
+        return self.group(self.meta.get("name_refs", {}).get(name, EMPTY))
+
+    def class_is_trackable(self, label: str) -> bool:
+        return label not in set(self.meta.get("untrackable_classes", ()))
+
+    @property
+    def has_class_map(self) -> bool:
+        return bool(self.meta.get("have_class_pass"))
+
     def ast_fingerprint(self, path: str) -> str | None:
         entry = self.entry(path)
         return entry.get("ast") if entry else None

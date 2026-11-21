@@ -12,6 +12,8 @@ is every test.
 
 from __future__ import annotations
 
+import ast
+
 from . import astutil
 from .diffparse import ADDED, DELETED, apply_hunks, parse_patch, touched_old_lines
 
@@ -124,11 +126,27 @@ def _for_modification(change, store, everything: int) -> int:
         # behave differently.  A test that reads the file as *data* still can.
         return opened_as_data
 
+    # Narrowing a class-body change to the tests that use that class is only
+    # sound while the edit does not add or remove a name or a string.  A
+    # changed key, a renamed helper or a new dialect name can be looked up by
+    # that name from anywhere, and no amount of class-usage evidence bounds it.
+    # Answering it costs a second parse of the whole file, so it is only asked
+    # when a changed line really does sit in a class body.
+    guard: list[bool] = []
+
+    def may_narrow() -> bool:
+        if not guard:
+            guard.append(store.has_class_map and _same_names(old_text, new_lines))
+        return guard[0]
+
     found = opened_as_data
     for hunk in change.hunks:
         changed, insertions = touched_old_lines(hunk)
         for line in changed:
-            found |= store.tests_for_line(path, line)
+            narrowed = None
+            if store.class_at(path, line) is not None and may_narrow():
+                narrowed = _class_body_tests(path, line, store)
+            found |= store.tests_for_line(path, line) if narrowed is None else narrowed
         for line in insertions:
             # The gap sits inside some statement - a multi-line signature, a
             # table literal - and inserting into it changes that statement.
@@ -139,6 +157,52 @@ def _for_modification(change, store, everything: int) -> int:
             else:
                 # New lines at module level run on import.
                 found |= store.tests_in_module(path)
+    return found
+
+
+
+def _same_names(old_text: str, new_lines: list[str]) -> bool:
+    """True when the edit changed no identifier and no string literal."""
+    try:
+        before = astutil.names_and_strings(ast.parse(old_text))
+        after = astutil.names_and_strings(ast.parse("\n".join(new_lines)))
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return False
+    return before == after
+
+
+def _class_body_tests(path: str, line: int, store) -> int | None:
+    """Tests a change to this class-body line could reach, or None to fall back.
+
+    A statement in a class body runs at import, so every importer executes it
+    and line coverage cannot tell them apart.  What does tell them apart is
+    whether the test ever used the class.  Three ways a test can be reached by
+    the change, and all three are measured:
+
+      * it built an instance of a class with this one in its MRO;
+      * it ran a method defined in this class, which covers a classmethod
+        reached without an instance;
+      * it ran a line that mentions the class by name, which covers reading
+        the class's data without building one, as `set(exp.Select.arg_types)`
+        does.
+
+    None means the evidence does not apply and the caller keeps the safe
+    statement-wide answer.
+    """
+    qualified = store.class_at(path, line)
+    if qualified is None:
+        return None
+    module = path[:-3].replace("/", ".")
+    if module.endswith(".__init__"):
+        module = module[: -len(".__init__")]
+    label = f"{module}:{qualified}"
+    if not store.class_is_trackable(label):
+        return None
+    found = store.tests_using_class(label)
+    found |= store.tests_running_methods_of(path, qualified)
+    # Keyed on the class's own qualified name, so a nested class is looked up
+    # as "Snowflake.Tokenizer" rather than as every Tokenizer in the project.
+    found |= store.tests_naming(qualified)
     return found
 
 

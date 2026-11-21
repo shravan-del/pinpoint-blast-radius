@@ -78,7 +78,7 @@ def _run_one(job: tuple) -> dict:
     test, mode = job
     number = test["number"]
     node_id = test["id"]
-    directory = WORK / ("raw" if mode == "coverage" else "raw-reads") / str(number)
+    directory = WORK / f"raw-{mode}" / str(number)
     if directory.exists():
         shutil.rmtree(directory)
     directory.mkdir(parents=True)
@@ -93,6 +93,8 @@ def _run_one(job: tuple) -> dict:
     if mode == "coverage":
         environment["COVERAGE_PROCESS_START"] = str(rcfile)
         environment["COVERAGE_FILE"] = str(directory / ".coverage")
+    if mode == "classes":
+        environment["PINPOINT_CLASSES"] = "1"
     environment["PINPOINT_AUDIT_DIR"] = str(directory)
     environment["PINPOINT_REPO_ROOT"] = str(SQLGLOT_ROOT)
     environment["SKIP_INTEGRATION"] = "0"
@@ -146,6 +148,9 @@ def _run_one(job: tuple) -> dict:
     import_reads: set[str] = set()  # opened by the import machinery
     imports: set[str] = set()
     scans: set[str] = set()
+    used_classes: set[str] = set()   # every class in the MRO of one we built
+    trackable: set[str] = set()
+    untrackable: set[str] = set()
     for record in sorted(directory.glob("seen-*.txt")):
         for line in record.read_text("utf-8", errors="replace").splitlines():
             if line.startswith("O "):
@@ -156,6 +161,12 @@ def _run_one(job: tuple) -> dict:
                 imports.add(line[2:])
             elif line.startswith("D "):
                 scans.add(line[2:])
+            elif line.startswith("C "):
+                used_classes.update(line[2:].split("|"))
+            elif line.startswith("T "):
+                trackable.add(line[2:])
+            elif line.startswith("U "):
+                untrackable.add(line[2:])
 
     result = {
         "number": number,
@@ -167,10 +178,14 @@ def _run_one(job: tuple) -> dict:
         "import_reads": sorted(import_reads),
         "imports": sorted(imports),
         "scans": sorted(scans),
+        "used_classes": sorted(used_classes),
+        "trackable": sorted(trackable),
+        "untrackable": sorted(untrackable),
         "tail": "" if exit_code == 0 else tail,
     }
 
-    target = WORK / ("tests" if mode == "coverage" else "reads") / f"{number}.json.gz"
+    out_names = {"coverage": "tests", "reads": "reads", "classes": "classes"}
+    target = WORK / out_names[mode] / f"{number}.json.gz"
     target.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(target, "wt", encoding="utf-8") as handle:
         json.dump(result, handle)
@@ -192,7 +207,7 @@ def _run_one(job: tuple) -> dict:
 
 def command_run(arguments: argparse.Namespace) -> int:
     mode = arguments.mode
-    out_name = "tests" if mode == "coverage" else "reads"
+    out_name = {"coverage": "tests", "reads": "reads", "classes": "classes"}[mode]
     tests = _read_tests()
     if arguments.only:
         wanted = set(arguments.only)
@@ -299,6 +314,10 @@ def command_build(arguments: argparse.Namespace) -> int:
     importers: dict[str, set[int]] = {}            # module -> tests
     module_tests: dict[str, set[int]] = {}         # path -> tests that ran any line
     scanners: dict[str, set[int]] = {}             # directory -> tests that listed it
+    class_users: dict[str, set[int]] = {}          # module:Qual -> tests that built one
+    trackable_classes: set[str] = set()
+    untrackable_classes: set[str] = set()
+    have_class_pass = False
     missing: list[int] = []
     failed: list[dict] = []
 
@@ -321,6 +340,16 @@ def command_build(arguments: argparse.Namespace) -> int:
             module_tests.setdefault(path, set()).add(number)
         for module in record["imports"]:
             importers.setdefault(module, set()).add(number)
+
+        classes_path = WORK / "classes" / f"{number}.json.gz"
+        if classes_path.exists():
+            with gzip.open(classes_path, "rt", encoding="utf-8") as handle:
+                classes_record = json.load(handle)
+            for label in classes_record.get("used_classes", ()):
+                class_users.setdefault(label, set()).add(number)
+            trackable_classes.update(classes_record.get("trackable", ()))
+            untrackable_classes.update(classes_record.get("untrackable", ()))
+            have_class_pass = True
 
         # Reads and directory scans come from the no-coverage pass when we have
         # one, so coverage's own file handling cannot leak into them.
@@ -422,6 +451,36 @@ def command_build(arguments: argparse.Namespace) -> int:
                     group_of_line[line] = bitsets.add(runners) if runners else -1
                 entry["runs"] = _runs(group_of_line, line_count)
 
+                # --- class bodies -------------------------------------
+                # A statement in a class body is the case line coverage cannot
+                # separate: it runs at import for every importer.  Record which
+                # class each such line belongs to, so the selector can ask who
+                # actually used that class instead.
+                in_class = astutil.class_body_lines(tree)
+                method_spans = astutil.method_body_lines(tree)
+                class_names = sorted(set(in_class.values()))
+                class_index = {name: i for i, name in enumerate(class_names)}
+                entry["classes"] = class_names
+                safe_to_narrow = astutil.narrowable_class_lines(tree)
+                entry["class_runs"] = _runs(
+                    {
+                        line: class_index[name]
+                        for line, name in in_class.items()
+                        if line in safe_to_narrow
+                    },
+                    line_count,
+                )
+                # Tests that ran a method *defined in* this class, which catches
+                # a classmethod reached without ever building an instance.
+                method_groups = []
+                for name in class_names:
+                    ran: set[int] = set()
+                    for start, end in method_spans.get(name, ()):
+                        for line in range(start, end + 1):
+                            ran |= per_line_tests.get(line, set())
+                    method_groups.append(bitsets.add(ran) if ran else -1)
+                entry["class_methods"] = method_groups
+
                 block_group_cache: dict[tuple[int, int], int] = {}
                 group_of_block_line = {}
                 for line, span in blocks.items():
@@ -445,6 +504,37 @@ def command_build(arguments: argparse.Namespace) -> int:
         entry["own_tests"] = bitsets.add(in_file) if in_file else -1
 
         entries[relative] = entry
+
+    # Which tests ran a line that reads an attribute of each named class.
+    # `set(exp.Select.arg_types)` reads Select without building one, and that
+    # is the read a class-usage map alone would miss.
+    name_reference_lines: dict[str, set[tuple[str, int]]] = {}
+    for relative in all_paths:
+        if not relative.endswith(".py"):
+            continue
+        absolute = SQLGLOT_ROOT / relative
+        if not absolute.is_file():
+            continue
+        try:
+            ref_tree = ast.parse(absolute.read_text("utf-8"))
+        except SyntaxError:
+            continue
+        for name, lines in astutil.attribute_reads(ref_tree).items():
+            bucket = name_reference_lines.setdefault(name, set())
+            for line in lines:
+                bucket.add((relative, line))
+
+    name_reference_groups: dict[str, int] = {}
+    for name, places in name_reference_lines.items():
+        runners: set[int] = set()
+        for relative, line in places:
+            runners |= covered.get(relative, {}).get(line, set())
+        if runners:
+            name_reference_groups[name] = bitsets.add(runners)
+
+    class_user_groups = {
+        label: bitsets.add(numbers) for label, numbers in class_users.items()
+    }
 
     known_modules = {
         _module_name(relative) for relative in all_paths if relative.endswith(".py")
@@ -496,6 +586,12 @@ def command_build(arguments: argparse.Namespace) -> int:
         "packages": packages,
         "directory_watchers": directory_watchers,
         "absent_modules": absent_modules,
+        "class_users": class_user_groups,
+        "name_refs": name_reference_groups,
+        # A class whose instantiation we could not hook is not narrowed: the
+        # selector keeps the safe "every importer" answer for its body.
+        "untrackable_classes": sorted(untrackable_classes - trackable_classes),
+        "have_class_pass": have_class_pass,
     }
     repo_paths = sorted(
         str(path.relative_to(SQLGLOT_ROOT))
@@ -537,6 +633,9 @@ def command_build(arguments: argparse.Namespace) -> int:
           f"{len(bitsets.table) * bitsets.width / 1e6:.1f} MB raw", file=sys.stderr)
     print(f"files mapped: {len(entries)}, sources bundled: {len(sources)}",
           file=sys.stderr)
+    print(f"class-usage pass: {have_class_pass}, {len(class_user_groups)} classes used, "
+          f"{len(untrackable_classes - trackable_classes)} untrackable, "
+          f"{len(name_reference_groups)} names referenced", file=sys.stderr)
     total_lines = own_line_hits + statement_fallbacks + dead_lines
     print(f"lines: {own_line_hits} that run themselves, "
           f"{statement_fallbacks} covered only through their statement, "
@@ -558,9 +657,11 @@ def main(argv: list[str]) -> int:
     runner.add_argument("--only", nargs="*", help="test numbers or node ids")
     runner.add_argument("--resume", action="store_true",
                         help="skip tests already recorded")
-    runner.add_argument("--mode", choices=("coverage", "reads"), default="coverage",
+    runner.add_argument("--mode", choices=("coverage", "reads", "classes"),
+                        default="coverage",
                         help="coverage: the line map.  reads: data reads and "
-                             "directory scans, without coverage in the way")
+                             "directory scans, without coverage in the way.  "
+                             "classes: which classes each test actually built")
     runner.set_defaults(func=command_run)
 
     builder = sub.add_parser("build", help="build the shipped maps")

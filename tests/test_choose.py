@@ -43,9 +43,34 @@ def never_called(value):
     return value - 1
 '''
 
+CLASS_SOURCE = '''\
+from sqlglot import helper, make_it
+
+
+class Widget:
+    TABLE = {
+        "a": 1,
+        "b": 2,
+    }
+    FLAG = True
+
+    def render(self):
+        return self.TABLE["a"]
+
+    MADE = make_it("x", flag=True)
+
+    class Inner:
+        DEPTH = 3
+
+
+def names_it():
+    return Widget.TABLE
+'''
+
 DATA_FILE = "tests/fixtures/thing.sql"
 MODULE = "sqlglot/thing.py"
 TEST_FILE = "tests/test_thing.py"
+CLASS_MODULE = "sqlglot/widget.py"
 
 
 def bitset(numbers) -> bytes:
@@ -151,9 +176,81 @@ def build_store(tmp: Path) -> MapStore:
                                "sqlglot/typing": builder.add({4})},
         # Tests 0..3 tried to import sqlglot._version and the import failed.
         "absent_modules": {"sqlglot._version": builder.add(importers)},
+        "have_class_pass": True,
+        # Only test 1 ever built a Widget; nobody built a Widget.Inner.
+        "class_users": {"sqlglot.widget:Widget": builder.add({1})},
+        # Line 20 (`return Widget.TABLE`) is the only mention of the name, and
+        # test 3 ran it.
+        "name_refs": {"Widget": builder.add({3})},
+        "untrackable_classes": ["sqlglot.widget:Widget.Inner"],
     }
-    repo_paths = [MODULE, DATA_FILE, TEST_FILE, "README.md",
+    repo_paths = [MODULE, DATA_FILE, TEST_FILE, CLASS_MODULE, "README.md",
                   "sqlglot/typing/__init__.py"]
+
+    # A second module with a class body, for the class-usage rule.
+    ctree = ast.parse(CLASS_SOURCE)
+    cowners = astutil.statement_owners(ctree)
+    cblocks = astutil.block_ranges(ctree)
+    in_class = astutil.class_body_lines(ctree)
+    method_spans = astutil.method_body_lines(ctree)
+    clines = len(CLASS_SOURCE.splitlines())
+    class_names = sorted(set(in_class.values()))
+    cindex = {n: i for i, n in enumerate(class_names)}
+
+    # Tests 0..3 import it.  Test 2 ran Widget.render.  Test 3 ran names_it.
+    cstmt = {}
+    render_span = method_spans.get("Widget", [(0, 0)])[0]
+    for line in range(1, clines + 1):
+        anchor = cowners.get(line)
+        if anchor is None:
+            continue
+        if render_span[0] <= anchor <= render_span[1]:
+            cstmt[anchor] = {2}
+        elif CLASS_SOURCE.splitlines()[anchor - 1].startswith("    return Widget.TABLE"):
+            cstmt[anchor] = {3}
+        else:
+            cstmt[anchor] = set(importers)
+
+    cgroup_line = {}
+    for line in range(1, clines + 1):
+        a = cowners.get(line)
+        r = cstmt.get(a) if a else None
+        cgroup_line[line] = builder.add(r) if r else -1
+    cgroup_block = {}
+    for line, span in cblocks.items():
+        inside = set()
+        for inner in range(span[0], span[1] + 1):
+            a = cowners.get(inner)
+            if a:
+                inside |= cstmt.get(a, set())
+        cgroup_block[line] = builder.add(inside) if inside else -1
+
+    method_groups = []
+    for name in class_names:
+        ran = set()
+        for st, en in method_spans.get(name, ()):
+            for line in range(st, en + 1):
+                a = cowners.get(line)
+                if a:
+                    ran |= cstmt.get(a, set())
+        method_groups.append(builder.add(ran) if ran else -1)
+
+    class_entry = {
+        "sha256": "z", "lines": clines,
+        "ast": astutil.fingerprint(CLASS_SOURCE),
+        "runs": runs(cgroup_line),
+        "block_runs": runs(cgroup_block),
+        "classes": class_names,
+        "class_runs": runs({
+            line: cindex[n] for line, n in in_class.items()
+            if line in astutil.narrowable_class_lines(ctree)
+        }),
+        "class_methods": method_groups,
+        "module": builder.add(importers),
+        "openers": -1,
+        "importers": builder.add(importers),
+        "own_tests": -1,
+    }
 
     path = tmp / "maps.zip"
     with zipfile.ZipFile(path, "w") as archive:
@@ -164,6 +261,8 @@ def build_store(tmp: Path) -> MapStore:
         archive.writestr("f/" + DATA_FILE + ".json", json.dumps(data_entry))
         archive.writestr("f/" + TEST_FILE + ".json", json.dumps(test_entry))
         archive.writestr("src/" + MODULE, MODULE_SOURCE)
+        archive.writestr("f/" + CLASS_MODULE + ".json", json.dumps(class_entry))
+        archive.writestr("src/" + CLASS_MODULE, CLASS_SOURCE)
         archive.writestr("src/" + TEST_FILE, "x = 1\n")
     return MapStore(path)
 
@@ -305,6 +404,45 @@ class SelectionTests(unittest.TestCase):
                          "completely different\nfile CONTENT\n")
         with self.assertRaises(Exception):
             choose.select(patch, self.store)
+
+    # -- the class-usage rule ----------------------------------------------
+
+    def test_a_class_body_value_selects_only_the_users_of_that_class(self):
+        """The ktz3 case: one entry of a table in a class body.  Every importer
+        runs that statement, so only class usage separates them."""
+        new = CLASS_SOURCE.replace('"b": 2,', '"b": 22,')
+        # test 1 built a Widget, test 2 ran Widget.render, test 3 names Widget.
+        self.assertEqual(self.chosen(diff_for(CLASS_MODULE, CLASS_SOURCE, new)),
+                         [1, 2, 3])
+
+    def test_a_class_body_change_that_renames_a_key_does_not_narrow(self):
+        """A changed string can be looked up by name from anywhere, so the
+        class-usage evidence does not bound it and we keep every importer."""
+        new = CLASS_SOURCE.replace('"b": 2,', '"bb": 2,')
+        self.assertEqual(self.chosen(diff_for(CLASS_MODULE, CLASS_SOURCE, new)),
+                         [0, 1, 2, 3])
+
+    def test_a_class_body_change_in_an_untrackable_class_does_not_narrow(self):
+        new = CLASS_SOURCE.replace("DEPTH = 3", "DEPTH = 4")
+        self.assertEqual(self.chosen(diff_for(CLASS_MODULE, CLASS_SOURCE, new)),
+                         [0, 1, 2, 3])
+
+    def test_a_method_body_still_uses_line_coverage(self):
+        new = CLASS_SOURCE.replace('return self.TABLE["a"]', 'return self.TABLE["b"]')
+        self.assertEqual(self.chosen(diff_for(CLASS_MODULE, CLASS_SOURCE, new)), [2])
+
+    def test_module_level_outside_a_class_still_selects_every_importer(self):
+        new = CLASS_SOURCE.replace("from sqlglot import helper",
+                                   "from sqlglot import helper\nEXTRA = 1")
+        self.assertEqual(self.chosen(diff_for(CLASS_MODULE, CLASS_SOURCE, new)),
+                         [0, 1, 2, 3])
+
+    def test_a_class_body_call_does_not_narrow(self):
+        """`MADE = make_it("x", flag=True)` runs at import, and the call may do
+        anything, so class usage does not bound it."""
+        new = CLASS_SOURCE.replace("flag=True", "flag=False")
+        self.assertEqual(self.chosen(diff_for(CLASS_MODULE, CLASS_SOURCE, new)),
+                         [0, 1, 2, 3])
 
     def test_several_files_union(self):
         patch = (diff_for(DATA_FILE, "SELECT 1;\n", "SELECT 2;\n")

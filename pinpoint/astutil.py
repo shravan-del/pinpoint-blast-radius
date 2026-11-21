@@ -131,3 +131,191 @@ def block_ranges(tree: ast.AST) -> dict[int, tuple[int, int]]:
 
     visit(tree)
     return blocks
+
+
+def class_body_lines(tree: ast.AST) -> dict[int, str]:
+    """Map a line to the class whose *body* it belongs to, if any.
+
+    A line counts only when the innermost thing containing it is a class body,
+    not a method.  `arg_types = {...}` in a class body is in; a line inside one
+    of that class's methods is not, because a method body already has ordinary
+    line coverage that says who ran it.
+
+    The value is the class's qualified name, so a nested class reads as
+    "Snowflake.Tokenizer".
+    """
+    owner: dict[int, str] = {}
+
+    def visit(node: ast.AST, enclosing: str | None) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                qualified = f"{enclosing}.{child.name}" if enclosing else child.name
+                end = child.end_lineno
+                if child.body and end is not None:
+                    for line in range(child.body[0].lineno, end + 1):
+                        owner[line] = qualified
+                visit(child, qualified)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # Everything inside a function belongs to the function.
+                end = child.end_lineno
+                if child.body and end is not None:
+                    for line in range(child.body[0].lineno, end + 1):
+                        owner.pop(line, None)
+                visit(child, None)
+            else:
+                visit(child, enclosing)
+
+    visit(tree, None)
+    return owner
+
+
+def method_body_lines(tree: ast.AST) -> dict[str, list[tuple[int, int]]]:
+    """For each class, the line spans of the methods defined directly in it."""
+    spans: dict[str, list[tuple[int, int]]] = {}
+
+    def visit(node: ast.AST, enclosing: str | None) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                qualified = f"{enclosing}.{child.name}" if enclosing else child.name
+                for inner in child.body:
+                    if isinstance(inner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        if inner.body and inner.end_lineno is not None:
+                            spans.setdefault(qualified, []).append(
+                                (inner.body[0].lineno, inner.end_lineno)
+                            )
+                visit(child, qualified)
+            else:
+                visit(child, enclosing if isinstance(child, ast.ClassDef) else None)
+
+    visit(tree, None)
+    return spans
+
+
+def _dotted(node: ast.AST) -> str | None:
+    """The dotted path of a Name/Attribute chain, or None."""
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def attribute_reads(tree: ast.AST) -> dict[str, set[int]]:
+    """Lines that read an attribute *of* a named class.
+
+    `set(exp.Select.arg_types)` reads Select's data without ever building one,
+    and that is the read a class-usage map cannot see.  What is recorded is
+    the owner of the attribute, by every dotted suffix of its path, so
+    `Snowflake.Tokenizer.KEYWORDS` records "Snowflake.Tokenizer" and
+    "Tokenizer" and `exp.Select.arg_types` records "exp.Select" and "Select".
+
+    Only the owner counts, never a bare mention.  `Dialects.TSQL = "tsql"`
+    defines an enum member and `"TRIGGER": exp.TriggerProperties` passes the
+    class along to something that will build one later - the first changes
+    nothing, and the second shows up as an instantiation. Counting bare
+    mentions made TSQL and TriggerProperties look like every test in the
+    suite.
+    """
+    found: dict[str, set[int]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute):
+            continue
+        line = getattr(node, "lineno", None)
+        if line is None:
+            continue
+        owner = _dotted(node.value)
+        if owner is None:
+            continue
+        parts = owner.split(".")
+        for start in range(len(parts)):
+            found.setdefault(".".join(parts[start:]), set()).add(line)
+    return found
+
+
+def names_and_strings(tree: ast.AST) -> set[str]:
+    """Every identifier and string literal in a tree.
+
+    Used as a guard: narrowing a class-body change to "the tests that use this
+    class" is only sound while the edit does not add or remove a name or a
+    string.  A changed key, a renamed function, a new dialect name can be
+    looked up from anywhere by that name, and no amount of class-usage
+    evidence bounds it.
+    """
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            found.add("n:" + node.id)
+        elif isinstance(node, ast.Attribute):
+            found.add("a:" + node.attr)
+        elif isinstance(node, ast.keyword) and node.arg:
+            found.add("k:" + node.arg)
+        elif isinstance(node, ast.arg):
+            found.add("p:" + node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            found.add("d:" + node.name)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            found.add("s:" + node.value)
+        elif isinstance(node, ast.alias):
+            found.add("i:" + node.name + ":" + (node.asname or ""))
+    return found
+
+
+def narrowable_class_lines(tree: ast.AST) -> set[int]:
+    """Class-body lines whose change cannot escape the class.
+
+    A statement in a class body runs at import, so if it *calls* something the
+    call happens for every importer and may do anything - register in a global
+    table, mutate shared state. Attributing such a change to "the tests that
+    use this class" would then be wrong, so those lines are excluded and keep
+    the safe statement-wide answer.
+
+    Two things are narrowable:
+
+      * a statement that evaluates no call at all, which is what a plain table
+        of constants is (`arg_types = {"this": True, ...}`);
+      * any line inside a `lambda`, because a lambda body does not run at
+        import. It runs when something calls it, and to call it you need the
+        class.
+    """
+    narrowable: set[int] = set()
+    deferred: set[int] = set()
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Lambda) and node.body is not None:
+            start = getattr(node.body, "lineno", None)
+            end = getattr(node.body, "end_lineno", None)
+            if start is not None and end is not None:
+                deferred.update(range(start, end + 1))
+
+    def has_immediate_call(node: ast.AST) -> bool:
+        for child in ast.iter_child_nodes(node):
+            # A lambda's body and a nested def's body are not run now.
+            if isinstance(child, ast.Lambda):
+                continue
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # The decorators and defaults do run now; the body does not.
+                for part in [*child.decorator_list, *child.args.defaults]:
+                    if isinstance(part, ast.Call) or has_immediate_call(part):
+                        return True
+                continue
+            if isinstance(child, ast.Call):
+                return True
+            if has_immediate_call(child):
+                return True
+        return False
+
+    for node in ast.walk(tree):
+        if not isinstance(node, _SPAN_NODES):
+            continue
+        start = getattr(node, "lineno", None)
+        end = getattr(node, "end_lineno", None)
+        if start is None or end is None:
+            continue
+        if isinstance(node, ast.Call) or has_immediate_call(node):
+            continue
+        narrowable.update(range(start, end + 1))
+
+    return narrowable | deferred
