@@ -462,6 +462,10 @@ def command_build(arguments: argparse.Namespace) -> int:
                 class_index = {name: i for i, name in enumerate(class_names)}
                 entry["classes"] = class_names
                 safe_to_narrow = astutil.narrowable_class_lines(tree)
+                entry["def_headers"] = _runs(
+                    dict.fromkeys(astutil.narrowable_def_headers(tree), 1),
+                    line_count,
+                )
                 entry["class_runs"] = _runs(
                     {
                         line: class_index[name]

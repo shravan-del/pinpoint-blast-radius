@@ -145,6 +145,13 @@ class MapStore:
         names = entry.get("classes", [])
         return names[index] if index < len(names) else None
 
+    def in_def_header(self, path: str, line: int) -> bool:
+        """True when this line is part of a `def` signature we may narrow."""
+        entry = self.entry(path)
+        if not entry:
+            return False
+        return self._run_value(entry.get("def_headers", []), line) == 1
+
     def tests_running_methods_of(self, path: str, qualified: str) -> int:
         """Tests that ran a method defined directly in this class."""
         entry = self.entry(path)

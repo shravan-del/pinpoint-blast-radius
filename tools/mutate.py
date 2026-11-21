@@ -198,6 +198,42 @@ def mutate_default_argument(rng: random.Random, path: str) -> tuple[str, str] | 
     return None
 
 
+def mutate_def_default(rng: random.Random, path: str) -> tuple[str, str] | None:
+    """Flip a constant default in a real `def` signature.
+
+    Distinct from mutate_default_argument, which matches text and in practice
+    hits keyword arguments at call sites.  The selector has a rule just for
+    signatures, so the rule needs mutants that are actually signatures.
+    """
+    text = _read(path)
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return None
+    options = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for value in [*node.args.defaults, *(node.args.kw_defaults or [])]:
+            if isinstance(value, ast.Constant) and isinstance(
+                value.value, (bool, int)
+            ) and value.lineno == value.end_lineno:
+                options.append(value)
+    if not options:
+        return None
+    victim = rng.choice(options)
+    lines = text.split("\n")
+    line = lines[victim.lineno - 1]
+    before, after = line[: victim.col_offset], line[victim.end_col_offset:]
+    if victim.value is True:
+        replacement = "False"
+    elif victim.value is False:
+        replacement = "True"
+    else:
+        replacement = str(victim.value + 1)
+    return text, _replace_line(text, victim.lineno - 1, before + replacement + after)
+
+
 def mutate_delete_statement(rng: random.Random, path: str) -> tuple[str, str] | None:
     text = _read(path)
     try:
@@ -380,6 +416,7 @@ PLAN = [
     ("executor", mutate_operator, "sqlglot/executor", 6),
     ("executor_delete", mutate_delete_statement, "sqlglot/executor", 4),
     ("default_argument", mutate_default_argument, "sqlglot", 5),
+    ("def_default", mutate_def_default, "sqlglot", 6),
     ("delete_statement", mutate_delete_statement, "sqlglot", 7),
     ("delete_line", mutate_delete_line, "sqlglot", 5),
     ("docstring", mutate_docstring, "sqlglot", 6),
@@ -419,6 +456,8 @@ def command_generate(arguments: argparse.Namespace) -> int:
     serial = 0
 
     for kind, mutator, area, weight in PLAN:
+        if arguments.kinds and kind not in arguments.kinds:
+            continue
         pool = _pool(area, rng)
         wanted = max(1, round(weight * scale))
         made = 0
@@ -443,6 +482,13 @@ def command_generate(arguments: argparse.Namespace) -> int:
             (commits / f"{commit_id}.patch").write_text(patch)
             manifest[commit_id] = {"kind": kind, "path": path}
             made += 1
+
+    if arguments.kinds:
+        (EVAL / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True))
+        shutil.copy(TESTS_JSON, EVAL / "tests.json")
+        print(f"wrote {len(manifest)} mutants to {commits}", file=sys.stderr)
+        return 0
 
     # New files: no old version, so they are built here rather than by a mutator.
     for name, body in NEW_FILE_BODIES.items():
@@ -737,6 +783,7 @@ def main(argv: list[str]) -> int:
     generator = sub.add_parser("generate")
     generator.add_argument("--count", type=int, default=120)
     generator.add_argument("--seed", type=int, default=20261120)
+    generator.add_argument("--kinds", nargs="*", help="only these kinds")
     generator.set_defaults(func=command_generate)
 
     labeler = sub.add_parser("label")

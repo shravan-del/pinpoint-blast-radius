@@ -34,12 +34,12 @@ TABLE = {
 }
 
 
-def used(value):
+def used(value, extra=True):
     """Doc."""
     return value + 1
 
 
-def never_called(value):
+def never_called(value, extra=True):
     return value - 1
 '''
 
@@ -145,6 +145,8 @@ def build_store(tmp: Path) -> MapStore:
         group_of_block_line[line] = builder.add(inside) if inside else -1
 
     module_entry = {
+        "def_headers": runs(dict.fromkeys(
+            astutil.narrowable_def_headers(tree), 1)),
         "sha256": "x", "lines": line_count,
         "ast": astutil.fingerprint(source),
         "runs": runs(group_of_line),
@@ -236,6 +238,8 @@ def build_store(tmp: Path) -> MapStore:
         method_groups.append(builder.add(ran) if ran else -1)
 
     class_entry = {
+        "def_headers": runs(dict.fromkeys(
+            astutil.narrowable_def_headers(ctree), 1)),
         "sha256": "z", "lines": clines,
         "ast": astutil.fingerprint(CLASS_SOURCE),
         "runs": runs(cgroup_line),
@@ -303,7 +307,7 @@ class SelectionTests(unittest.TestCase):
     # -- the harmless cases ------------------------------------------------
 
     def test_a_comment_selects_nothing(self):
-        new = MODULE_SOURCE.replace("def used(value):", "# a note\ndef used(value):")
+        new = MODULE_SOURCE.replace("def used(", "# a note\ndef used(")
         self.assertEqual(self.chosen(diff_for(MODULE, MODULE_SOURCE, new)), [])
 
     def test_a_docstring_edit_selects_nothing(self):
@@ -349,7 +353,7 @@ class SelectionTests(unittest.TestCase):
     # -- the dangerous cases -----------------------------------------------
 
     def test_a_syntax_error_selects_every_importer(self):
-        new = MODULE_SOURCE.replace("def used(value):", "def used(value:")
+        new = MODULE_SOURCE.replace("def used(value, extra=True):", "def used(value:")
         self.assertEqual(self.chosen(diff_for(MODULE, MODULE_SOURCE, new)), [0, 1, 2, 3])
 
     def test_a_syntax_error_in_a_test_file_selects_its_tests(self):
@@ -442,6 +446,48 @@ class SelectionTests(unittest.TestCase):
         anything, so class usage does not bound it."""
         new = CLASS_SOURCE.replace("flag=True", "flag=False")
         self.assertEqual(self.chosen(diff_for(CLASS_MODULE, CLASS_SOURCE, new)),
+                         [0, 1, 2, 3])
+
+    def test_adding_an_unused_helper_selects_nothing(self):
+        new = MODULE_SOURCE + "\n\ndef brand_new_helper(value):\n    return value\n"
+        self.assertEqual(self.chosen(diff_for(MODULE, MODULE_SOURCE, new)), [])
+
+    def test_adding_a_helper_that_shadows_a_builtin_is_not_inert(self):
+        new = MODULE_SOURCE + "\n\ndef len(value):\n    return 0\n"
+        self.assertEqual(self.chosen(diff_for(MODULE, MODULE_SOURCE, new)), [0, 1, 2, 3])
+
+    def test_adding_a_decorated_helper_is_not_inert(self):
+        new = MODULE_SOURCE + "\n\n@os.register\ndef brand_new(value):\n    return value\n"
+        self.assertEqual(self.chosen(diff_for(MODULE, MODULE_SOURCE, new)), [0, 1, 2, 3])
+
+    def test_adding_a_class_is_not_inert(self):
+        """A class can register itself through a metaclass or
+        __init_subclass__, so adding one is not a no-op."""
+        new = MODULE_SOURCE + "\n\nclass BrandNew:\n    pass\n"
+        self.assertEqual(self.chosen(diff_for(MODULE, MODULE_SOURCE, new)), [0, 1, 2, 3])
+
+    def test_adding_an_import_is_not_inert(self):
+        new = MODULE_SOURCE.replace("import os\n", "import os\nimport sys\n")
+        self.assertEqual(self.chosen(diff_for(MODULE, MODULE_SOURCE, new)), [0, 1, 2, 3])
+
+    def test_a_default_argument_selects_the_callers(self):
+        """A default is read when the function is called, so only a test that
+        reached the body can notice."""
+        new = MODULE_SOURCE.replace("def used(value, extra=True):",
+                                    "def used(value, extra=False):")
+        self.assertEqual(self.chosen(diff_for(MODULE, MODULE_SOURCE, new)), [1])
+
+    def test_a_default_argument_on_a_dead_function_selects_nothing(self):
+        new = MODULE_SOURCE.replace("def never_called(value, extra=True):",
+                                    "def never_called(value, extra=False):")
+        self.assertEqual(self.chosen(diff_for(MODULE, MODULE_SOURCE, new)), [])
+
+    def test_renaming_a_parameter_does_not_narrow(self):
+        """A caller using that keyword fails at the call, before the body, so
+        "the tests that ran the body" does not bound it."""
+        new = MODULE_SOURCE.replace("def used(value, extra=True):",
+                                    "def used(value, other=True):")
+        self.assertEqual(self.chosen(diff_for(MODULE, MODULE_SOURCE, new)),
                          [0, 1, 2, 3])
 
     def test_several_files_union(self):

@@ -108,7 +108,63 @@ def _for_modification(change, store, everything: int) -> int:
         return everything
 
     new_lines = apply_hunks(old_text.split("\n"), change.hunks, path)
-    fingerprint = astutil.fingerprint("\n".join(new_lines))
+    new_source = "\n".join(new_lines)
+
+    # One parse of each side, reused by every rule below.  Parsing
+    # sqlglot/parser.py costs 70 ms, so doing it three times would show up.
+    try:
+        new_tree = ast.parse(new_source)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        new_tree = None
+
+    removes_anything = any(
+        body_line.startswith("-")
+        for hunk in change.hunks
+        for body_line in hunk.body
+    )
+
+    # Parsing the old side costs as much as parsing the new one - 70 ms for
+    # sqlglot/parser.py - so it is only done when a rule below will use it:
+    # the inert-addition check, or the name guard that the class-body and
+    # signature rules depend on.
+    wants_old = not removes_anything
+    if not wants_old and store.has_class_map:
+        for hunk in change.hunks:
+            changed, _ = touched_old_lines(hunk)
+            if any(
+                store.class_at(path, line) is not None
+                or store.in_def_header(path, line)
+                for line in changed
+            ):
+                wants_old = True
+                break
+
+    old_tree = None
+    if new_tree is not None and wants_old:
+        try:
+            old_tree = ast.parse(old_text)
+        except (SyntaxError, ValueError, RecursionError, MemoryError):
+            old_tree = None
+
+    if (
+        new_tree is not None
+        and old_tree is not None
+        and not removes_anything
+        and astutil.added_statements_are_inert(old_tree, new_tree)
+    ):
+        # The new module is the old one plus undecorated top-level `def`s with
+        # names nothing else uses.  That binds a name and does nothing else:
+        # the body never runs, and nothing can call it because nothing names
+        # it yet.
+        return opened_as_data
+
+    names_match = (
+        new_tree is not None
+        and old_tree is not None
+        and astutil.names_and_strings(old_tree) == astutil.names_and_strings(new_tree)
+    )
+    # fingerprint_tree mutates the tree it is given, so it goes last.
+    fingerprint = astutil.fingerprint_tree(new_tree) if new_tree is not None else None
 
     if fingerprint is None:
         # The new file does not parse.  Importing it raises, so every test that
@@ -126,26 +182,23 @@ def _for_modification(change, store, everything: int) -> int:
         # behave differently.  A test that reads the file as *data* still can.
         return opened_as_data
 
-    # Narrowing a class-body change to the tests that use that class is only
-    # sound while the edit does not add or remove a name or a string.  A
-    # changed key, a renamed helper or a new dialect name can be looked up by
-    # that name from anywhere, and no amount of class-usage evidence bounds it.
-    # Answering it costs a second parse of the whole file, so it is only asked
-    # when a changed line really does sit in a class body.
-    guard: list[bool] = []
-
-    def may_narrow() -> bool:
-        if not guard:
-            guard.append(store.has_class_map and _same_names(old_text, new_lines))
-        return guard[0]
+    # Narrowing to "the tests that use this" is only sound while the edit adds
+    # and removes no identifier and no string.  A changed key, a renamed
+    # helper or a new dialect name can be looked up by that name from
+    # anywhere, and no usage evidence bounds it.
+    may_narrow = store.has_class_map and names_match
 
     found = opened_as_data
     for hunk in change.hunks:
         changed, insertions = touched_old_lines(hunk)
         for line in changed:
             narrowed = None
-            if store.class_at(path, line) is not None and may_narrow():
+            if store.class_at(path, line) is not None and may_narrow:
                 narrowed = _class_body_tests(path, line, store)
+            elif store.in_def_header(path, line) and may_narrow:
+                # A default argument is read when the function is called, so
+                # only a test that reached the body can notice the change.
+                narrowed = store.tests_for_block(path, line)
             found |= store.tests_for_line(path, line) if narrowed is None else narrowed
         for line in insertions:
             # The gap sits inside some statement - a multi-line signature, a
@@ -159,16 +212,6 @@ def _for_modification(change, store, everything: int) -> int:
                 found |= store.tests_in_module(path)
     return found
 
-
-
-def _same_names(old_text: str, new_lines: list[str]) -> bool:
-    """True when the edit changed no identifier and no string literal."""
-    try:
-        before = astutil.names_and_strings(ast.parse(old_text))
-        after = astutil.names_and_strings(ast.parse("\n".join(new_lines)))
-    except (SyntaxError, ValueError, RecursionError, MemoryError):
-        return False
-    return before == after
 
 
 def _class_body_tests(path: str, line: int, store) -> int | None:

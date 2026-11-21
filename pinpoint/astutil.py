@@ -38,6 +38,16 @@ def strip_docstrings(tree: ast.AST) -> None:
             body[0] = ast.Pass()
 
 
+def fingerprint_tree(tree: ast.AST) -> str | None:
+    """The fingerprint of an already-parsed tree.  Mutates it: docstrings go."""
+    strip_docstrings(tree)
+    try:
+        dumped = ast.dump(tree, annotate_fields=True, include_attributes=False)
+    except (RecursionError, MemoryError):
+        return None
+    return hashlib.sha256(dumped.encode("utf-8")).hexdigest()
+
+
 def fingerprint(source: str) -> str | None:
     """A hash of what the file *means*, or None when it does not parse.
 
@@ -50,12 +60,7 @@ def fingerprint(source: str) -> str | None:
         tree = ast.parse(source)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return None
-    strip_docstrings(tree)
-    try:
-        dumped = ast.dump(tree, annotate_fields=True, include_attributes=False)
-    except (RecursionError, MemoryError):
-        return None
-    return hashlib.sha256(dumped.encode("utf-8")).hexdigest()
+    return fingerprint_tree(tree)
 
 
 def statement_owners(tree: ast.AST) -> dict[int, int]:
@@ -319,3 +324,97 @@ def narrowable_class_lines(tree: ast.AST) -> set[int]:
         narrowable.update(range(start, end + 1))
 
     return narrowable | deferred
+
+
+def narrowable_def_headers(tree: ast.AST) -> set[int]:
+    """Lines of a `def` header whose change only affects callers.
+
+    A default argument is evaluated once, at import, and stored on the
+    function object; an annotation under `from __future__ import annotations`
+    is never evaluated at all.  Changing either can only be noticed by a call
+    that reaches the function body, so the blast radius is the tests that ran
+    that body - not every test that imports the module, which is what the
+    statement rule has to say about a `def` line.
+
+    Decorator lines are excluded: a decorator runs at import and can do
+    anything.  So is a header whose defaults contain a call, for the same
+    reason.
+    """
+    headers: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not node.body:
+            continue
+        arguments = node.args
+        defaults = [*arguments.defaults, *(arguments.kw_defaults or [])]
+        if any(
+            value is not None
+            and any(isinstance(inner, ast.Call) for inner in ast.walk(value))
+            for value in defaults
+        ):
+            continue
+        # From the `def` line to the line before the body starts.  Decorators
+        # sit above the `def` line and are deliberately left out.
+        headers.update(range(node.lineno, node.body[0].lineno))
+    return headers
+
+
+_INERT_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+
+def module_level_names(tree: ast.AST) -> set[str]:
+    """Every name bound at a module's top level."""
+    bound: set[str] = set()
+    for statement in getattr(tree, "body", []):
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(statement.name)
+        elif isinstance(statement, (ast.Import, ast.ImportFrom)):
+            for alias in statement.names:
+                bound.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                if isinstance(target, ast.Name):
+                    bound.add(target.id)
+        elif isinstance(statement, (ast.AnnAssign, ast.AugAssign)):
+            if isinstance(statement.target, ast.Name):
+                bound.add(statement.target.id)
+    return bound
+
+
+def added_statements_are_inert(old_tree: ast.AST, new_tree: ast.AST) -> bool:
+    """True when the new module is the old one plus harmless function defs.
+
+    Adding an undecorated `def` at module level binds a name and nothing else:
+    the body does not run, and nothing can call it because nothing names it
+    yet.  Adding anything else is not harmless - a class can register itself
+    through a metaclass or `__init_subclass__`, an import runs another
+    module, a decorator runs at import, and a bare statement does whatever it
+    says.
+
+    The new name must also be genuinely new, including not shadowing a builtin
+    the rest of the module might be using.
+    """
+    import builtins
+    import difflib
+
+    old_body = getattr(old_tree, "body", [])
+    new_body = getattr(new_tree, "body", [])
+    old_dumps = [ast.dump(node, include_attributes=False) for node in old_body]
+    new_dumps = [ast.dump(node, include_attributes=False) for node in new_body]
+
+    taken = module_level_names(old_tree) | set(dir(builtins))
+    matcher = difflib.SequenceMatcher(a=old_dumps, b=new_dumps, autojunk=False)
+    for tag, _, _, start, end in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag != "insert":
+            return False
+        for node in new_body[start:end]:
+            if not isinstance(node, _INERT_DEFS):
+                return False
+            if node.decorator_list:
+                return False
+            if node.name in taken:
+                return False
+    return True
