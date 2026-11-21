@@ -527,3 +527,57 @@ def table_keys_of(tree: ast.AST) -> dict[str, set[str]]:
     for table_name, forms in table_entries(tree).values():
         found.setdefault(table_name, set()).update(forms)
     return found
+
+
+def _code_fingerprint(code) -> tuple:
+    """What a code object *does*, with everything positional stripped out.
+
+    Line tables, column positions, the filename and the first line number all
+    change when a comment moves, and none of them change behaviour.  Nested
+    code objects - comprehensions, lambdas, methods - are compared the same
+    way, recursively.
+    """
+    import types
+
+    constants = tuple(
+        _code_fingerprint(constant) if isinstance(constant, types.CodeType)
+        else (type(constant).__name__, constant)
+        for constant in code.co_consts
+    )
+    return (
+        code.co_code,
+        constants,
+        code.co_names,
+        code.co_varnames,
+        code.co_freevars,
+        code.co_cellvars,
+        code.co_flags,
+        code.co_argcount,
+        code.co_posonlyargcount,
+        code.co_kwonlyargcount,
+        code.co_nlocals,
+        code.co_stacksize,
+    )
+
+
+def compiles_the_same(old_source: str, new_source: str) -> bool:
+    """True when both sources compile to byte-identical behaviour.
+
+    Stronger than comparing syntax trees: the compiler folds constants, so
+    `1 + 2` and `3` come out the same, and a reordered literal or a changed
+    parenthesisation that the optimiser undoes also comes out the same.  If
+    the bytecode, the constants, the names and the flags all match, nothing
+    the interpreter does can differ.
+
+    Both sides are compiled with the same filename and flags so that nothing
+    incidental can make them differ.
+    """
+    try:
+        old_code = compile(old_source, "<pinpoint>", "exec", dont_inherit=True)
+        new_code = compile(new_source, "<pinpoint>", "exec", dont_inherit=True)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return False
+    try:
+        return _code_fingerprint(old_code) == _code_fingerprint(new_code)
+    except (RecursionError, MemoryError):
+        return False

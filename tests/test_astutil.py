@@ -68,6 +68,39 @@ class TestFingerprint(unittest.TestCase):
         self.assertEqual(astutil.fingerprint(a), astutil.fingerprint(b))
 
 
+class TestCompilesTheSame(unittest.TestCase):
+    def test_constant_folding_is_equivalent(self):
+        self.assertTrue(astutil.compiles_the_same("X = 1 + 2\n", "X = 3\n"))
+
+    def test_redundant_parentheses_are_equivalent(self):
+        self.assertTrue(astutil.compiles_the_same("X = (((1)))\n", "X = 1\n"))
+
+    def test_a_moved_comment_is_equivalent(self):
+        self.assertTrue(astutil.compiles_the_same(
+            "def f():\n    return 1\n", "# note\ndef f():\n    # note\n    return 1\n"))
+
+    def test_a_real_change_is_not(self):
+        self.assertFalse(astutil.compiles_the_same("X = 1 + 2\n", "X = 4\n"))
+
+    def test_a_changed_operator_is_not(self):
+        self.assertFalse(astutil.compiles_the_same(
+            "def f(a, b):\n    return a == b\n",
+            "def f(a, b):\n    return a != b\n"))
+
+    def test_a_change_inside_a_nested_function_is_not(self):
+        self.assertFalse(astutil.compiles_the_same(
+            "def f():\n    def g():\n        return 1\n    return g\n",
+            "def f():\n    def g():\n        return 2\n    return g\n"))
+
+    def test_a_changed_docstring_is_not_equivalent_here(self):
+        """It lands in co_consts.  The syntax-tree rule is what catches it."""
+        self.assertFalse(astutil.compiles_the_same(
+            'def f():\n    """a"""\n', 'def f():\n    """b"""\n'))
+
+    def test_a_syntax_error_is_never_equivalent(self):
+        self.assertFalse(astutil.compiles_the_same("X = 1\n", "X = (\n"))
+
+
 class TestStatementOwners(unittest.TestCase):
     def test_a_multi_line_table_maps_to_its_first_line(self):
         found = owners("""
